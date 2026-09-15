@@ -5,7 +5,7 @@ services:
       POSTGRES_USER: relay
       POSTGRES_PASSWORD: relay
       POSTGRES_DB: relay
-    ports: ["${DB_PORT:-5432}:5432"]
+    ports: ["127.0.0.1:${DB_PORT:-5432}:5432"]
     volumes:
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
@@ -35,7 +35,10 @@ services:
     environment:
       DATABASE_URL: postgresql://relay:relay@db:5432/relay
       PYTHONUNBUFFERED: "1"
-    ports: ["${API_PORT:-8000}:8000"]
+      CORS_ORIGINS: http://localhost:${WEB_PORT:-5173},http://127.0.0.1:${WEB_PORT:-5173}
+    # Portas só no loopback: a auth do case é um header forjável, então o alcance de rede
+    # é a única barreira entre empresas.
+    ports: ["127.0.0.1:${API_PORT:-8000}:8000"]
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -52,5 +55,5 @@ services:
     build: ./web
     environment:
       VITE_API_URL: http://localhost:${API_PORT:-8000}
-    ports: ["${WEB_PORT:-5173}:5173"]
+    ports: ["127.0.0.1:${WEB_PORT:-5173}:5173"]
     depends_on: [api]

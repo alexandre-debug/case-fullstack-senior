@@ -86,19 +86,54 @@ security() {
     "$(http_code -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d '{"kind":"report\nINFO: linha forjada"}')"
   check "CORS não libera origem arbitrária" "" \
     "$(curl -s -D - -o /dev/null --max-time 30 "$API/jobs" -H 'X-Auth: 1:user' -H 'Origin: http://evil.test' | tr -d '\r' | grep -i '^access-control-allow-origin' || true)"
+  check "CORS libera a origem da web UI" "access-control-allow-origin: http://localhost:${WEB_PORT:-5173}" \
+    "$(curl -s -D - -o /dev/null --max-time 30 "$API/jobs" -H 'X-Auth: 1:user' -H "Origin: http://localhost:${WEB_PORT:-5173}" | tr -d '\r' | grep -i '^access-control-allow-origin' || true)"
+  check "GET /admin/jobs como admin da empresa 2 traz só a empresa 2" "[2]" \
+    "$(curl -s --max-time 30 "$API/admin/jobs" -H 'X-Auth: 2:admin' | companies_in)"
+  check "X-Auth com sufixo após a role (1:admin:x) -> 401" 401 "$(http_code "$API/jobs" -H 'X-Auth: 1:admin:x')"
+  check "POST /jobs com kind desconhecido -> 422" 422 \
+    "$(http_code -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d '{"kind":"export"}')"
+
+  check "GET /jobs/{id} de outra empresa como admin -> 404" 404 "$(http_code "$API/jobs/$job" -H 'X-Auth: 2:admin')"
+  check "GET /jobs/{id}/result de outra empresa como admin -> 404" 404 "$(http_code "$API/jobs/$result_job/result" -H 'X-Auth: 2:admin')"
+  check "404 de outra empresa é idêntico ao de id inexistente" \
+    "$(curl -s --max-time 30 "$API/jobs/2147483647/result" -H 'X-Auth: 2:user')" \
+    "$(curl -s --max-time 30 "$API/jobs/$result_job/result" -H 'X-Auth: 2:user')"
+  check "GET /admin/jobs com empresa inexistente -> 401" 401 "$(http_code "$API/admin/jobs" -H 'X-Auth: 999:admin')"
+  check "Host desconhecido (DNS rebinding) -> 400" 400 "$(http_code "$API/jobs" -H 'X-Auth: 1:user' -H 'Host: evil.test')"
+
+  local web="http://localhost:${WEB_PORT:-5173}"
+  check "preflight do GET da UI (X-Auth) -> 200" "200 $web" "$(preflight "$web" GET x-auth)"
+  check "preflight do POST da UI (Content-Type, X-Auth) -> 200" "200 $web" "$(preflight "$web" POST content-type,x-auth)"
+  check "preflight da UI aberta por 127.0.0.1 -> 200" "200 http://127.0.0.1:${WEB_PORT:-5173}" \
+    "$(preflight "http://127.0.0.1:${WEB_PORT:-5173}" GET x-auth)"
+  check "preflight de origem arbitrária -> 400" "400 " "$(preflight http://evil.test POST content-type,x-auth)"
+
+  wait_queue
+  check "POST /jobs da UI ({\"kind\":\"report\"}) continua 200" 200 \
+    "$(http_code -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d "$BODY")"
+}
+
+# Simula o preflight do navegador; imprime "<status> <access-control-allow-origin>".
+preflight() { # preflight <origem> <método> <headers>
+  curl -s -o /dev/null -D - --max-time 30 -X OPTIONS "$API/jobs" -H "Origin: $1" \
+    -H "Access-Control-Request-Method: $2" -H "Access-Control-Request-Headers: $3" |
+    tr -d '\r' | awk 'NR == 1 { code = $2 } tolower($1) == "access-control-allow-origin:" { origin = $2 } END { print code, origin }'
 }
 
 concurrency() {
   echo "== Concorrência e cota (Sintoma 2)"
-  local max worst=0 active round
+  local max worst=0 accepted=0 active round
   max=$(sql "SELECT max_concurrent_jobs FROM companies WHERE id=2")
   for round in 1 2 3; do
     wait_queue
-    seq 20 | xargs -P 20 -I{} curl -s -o /dev/null --max-time 30 -X POST "$API/jobs" \
-      -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d "$BODY"
+    accepted=$((accepted + $(seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time 30 -X POST "$API/jobs" \
+      -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d "$BODY" | grep -c '^200$')))
     active=$(sql "SELECT count(*) FROM jobs WHERE company_id=2 AND status IN ('queued','running')")
     [ "$active" -gt "$worst" ] && worst=$active
   done
+  check "POSTs simultâneos foram aceitos ao menos uma vez (senão o teste de limite não prova nada)" 1 \
+    "$([ "$accepted" -gt 0 ] && echo 1 || echo 0)"
   check "20 POST simultâneos respeitam max_concurrent_jobs (pior de 3 rodadas)" "<= $max" \
     "$([ "$worst" -le "$max" ] && echo "<= $max" || echo "$worst")"
 
