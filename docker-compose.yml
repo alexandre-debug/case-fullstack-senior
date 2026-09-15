@@ -5,7 +5,7 @@ services:
       POSTGRES_USER: relay
       POSTGRES_PASSWORD: relay
       POSTGRES_DB: relay
-    ports: ["5432:5432"]
+    ports: ["${DB_PORT:-5432}:5432"]
     volumes:
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
@@ -19,7 +19,7 @@ services:
     environment:
       DATABASE_URL: postgresql://relay:relay@db:5432/relay
       PYTHONUNBUFFERED: "1"
-    ports: ["8000:8000"]
+    ports: ["${API_PORT:-8000}:8000"]
     depends_on:
       db:
         condition: service_healthy
@@ -35,6 +35,6 @@ services:
   web:
     build: ./web
     environment:
-      VITE_API_URL: http://localhost:8000
-    ports: ["5173:5173"]
+      VITE_API_URL: http://localhost:${API_PORT:-8000}
+    ports: ["${WEB_PORT:-5173}:5173"]
     depends_on: [api]
