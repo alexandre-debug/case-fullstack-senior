@@ -29,11 +29,11 @@ check() { # check <descrição> <esperado> <obtido>
   fi
 }
 
-# Espera a fila esvaziar e nenhum job estar rodando ativamente (até 60s).
+# Espera a fila esvaziar e nenhum job estar rodando com lease válido (até 60s).
 wait_queue() {
   local i=0
   while [ $i -lt 60 ]; do
-    [ "$(sql "SELECT count(*) FROM jobs WHERE status='queued' OR (status='running' AND updated_at > now() - interval '30 seconds')")" = "0" ] && return
+    [ "$(sql "SELECT count(*) FROM jobs WHERE status='queued' OR (status='running' AND coalesce(lease_expires_at, updated_at + interval '30 seconds') > now())")" = "0" ] && return
     sleep 1; i=$((i + 1))
   done
 }
@@ -51,6 +51,13 @@ items = data.get("items", data) if isinstance(data, dict) else data
 print(sorted({j["company_id"] for j in items}) if isinstance(items, list) else data)'
 }
 
+# Simula o preflight do navegador; imprime "<status> <access-control-allow-origin>".
+preflight() { # preflight <origem> <método> <headers>
+  curl -s -o /dev/null -D - --max-time 30 -X OPTIONS "$API/jobs" -H "Origin: $1" \
+    -H "Access-Control-Request-Method: $2" -H "Access-Control-Request-Headers: $3" |
+    tr -d '\r' | awk 'NR == 1 { code = $2 } tolower($1) == "access-control-allow-origin:" { origin = $2 } END { print code, origin }'
+}
+
 schema() {
   echo "== Schema e migrações"
   check "migrações versionadas aplicadas (tabela schema_migrations)" 1 \
@@ -63,6 +70,8 @@ schema() {
     "$(sql "SELECT (count(*) > 0)::int FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] WHERE i.indrelid='job_results'::regclass AND i.indisunique AND i.indnatts=1 AND a.attname='job_id'")"
   check "companies.job_quota não pode ficar negativa (CHECK)" 1 \
     "$(sql "SELECT (count(*) > 0)::int FROM pg_constraint WHERE conrelid='companies'::regclass AND contype='c' AND pg_get_constraintdef(oid) LIKE '%job_quota%'")"
+  check "job em queued sempre tem tentativas restantes (CHECK)" 1 \
+    "$(sql "SELECT (count(*) > 0)::int FROM pg_constraint WHERE conrelid='jobs'::regclass AND contype='c' AND pg_get_constraintdef(oid) LIKE '%attempts < max_attempts%'")"
 }
 
 security() {
@@ -114,13 +123,6 @@ security() {
     "$(http_code -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d "$BODY")"
 }
 
-# Simula o preflight do navegador; imprime "<status> <access-control-allow-origin>".
-preflight() { # preflight <origem> <método> <headers>
-  curl -s -o /dev/null -D - --max-time 30 -X OPTIONS "$API/jobs" -H "Origin: $1" \
-    -H "Access-Control-Request-Method: $2" -H "Access-Control-Request-Headers: $3" |
-    tr -d '\r' | awk 'NR == 1 { code = $2 } tolower($1) == "access-control-allow-origin:" { origin = $2 } END { print code, origin }'
-}
-
 concurrency() {
   echo "== Concorrência e cota (Sintoma 2)"
   local max worst=0 accepted=0 active round
@@ -139,16 +141,39 @@ concurrency() {
 
   wait_queue
   max=$(sql "SELECT max_concurrent_jobs FROM companies WHERE id=1")
-  curl -s -o /dev/null --max-time 30 -X POST "$API/jobs" -H 'X-Auth: 1:user' -H 'Content-Type: application/json' -d "$BODY" &
-  curl -s -o /dev/null --max-time 30 -X POST "$API/jobs" -H 'X-Auth: 1:user' -H 'Content-Type: application/json' -d "$BODY" &
-  wait
+  accepted=$({
+    curl -s -o /dev/null -w '%{http_code}\n' --max-time 30 -X POST "$API/jobs" -H 'X-Auth: 1:user' -H 'Content-Type: application/json' -d "$BODY" &
+    curl -s -o /dev/null -w '%{http_code}\n' --max-time 30 -X POST "$API/jobs" -H 'X-Auth: 1:user' -H 'Content-Type: application/json' -d "$BODY" &
+    wait
+  } | grep -c '^200$')
   active=$(sql "SELECT count(*) FROM jobs WHERE company_id=1 AND status IN ('queued','running')")
+  check "repro do KNOWN_ISSUES (2 POST simultâneos na empresa 1): ao menos um aceito" 1 \
+    "$([ "$accepted" -gt 0 ] && echo 1 || echo 0)"
   check "repro do KNOWN_ISSUES (2 POST simultâneos na empresa 1) respeita o limite" "<= $max" \
     "$([ "$active" -le "$max" ] && echo "<= $max" || echo "$active")"
 
   check "nenhum job com mais de um resultado" 0 \
     "$(sql "SELECT count(*) FROM (SELECT job_id FROM job_results GROUP BY job_id HAVING count(*) > 1) d")"
   check "nenhuma empresa com cota negativa" 0 "$(sql "SELECT count(*) FROM companies WHERE job_quota < 0")"
+  check "nenhum job preso em running com lease vencido há mais de 2 min" 0 \
+    "$(sql "SELECT count(*) FROM jobs WHERE status='running' AND coalesce(lease_expires_at, updated_at + interval '30 seconds') < now() - interval '2 minutes'" 2>/dev/null)"
+
+  wait_queue
+  local key ids
+  key="verify-$$-$(date +%s)"
+  ids=$(seq 5 | xargs -P 5 -I{} curl -s -w '\n' --max-time 30 -X POST "$API/jobs" -H 'X-Auth: 2:user' \
+    -H 'Content-Type: application/json' -H "Idempotency-Key: $key" -d "$BODY" |
+    python3 -c 'import json, sys; print(len({json.loads(l).get("id") for l in sys.stdin if l.strip()}))')
+  check "5 POST simultâneos com a mesma Idempotency-Key criam um único job" "1 id, 1 job" \
+    "$ids id, $(sql "SELECT count(*) FROM jobs WHERE idempotency_key='$key'" 2>/dev/null) job"
+  check "mesma Idempotency-Key com outro kind -> 422" 422 \
+    "$(http_code -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -H "Idempotency-Key: $key" -d '{"kind":"import"}')"
+
+  wait_queue
+  sql "UPDATE companies SET job_quota = 0 WHERE id=2" >/dev/null
+  check "POST /jobs sem cota -> 402" 402 \
+    "$(http_code -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d "$BODY")"
+  sql "UPDATE companies SET job_quota = 1000000 WHERE id=2" >/dev/null
 
   wait_queue
   sleep 6
@@ -200,6 +225,12 @@ if [ "$(http_code "$API/docs")" != "200" ]; then
   echo "API não responde em $API. Suba o stack com: docker compose up -d --build"
   exit 2
 fi
+
+# O verify não pode gastar a cota real das empresas: fixa uma cota alta durante a execução e restaura no fim.
+QUOTAS=$(sql "SELECT string_agg(id || ':' || job_quota, ' ') FROM companies WHERE id IN (1, 2)")
+restore_quotas() { for pair in $QUOTAS; do sql "UPDATE companies SET job_quota = ${pair#*:} WHERE id = ${pair%%:*}" >/dev/null; done; }
+trap restore_quotas EXIT
+sql "UPDATE companies SET job_quota = 1000000 WHERE id IN (1, 2)" >/dev/null
 
 case "${1:-all}" in
   schema) schema ;;

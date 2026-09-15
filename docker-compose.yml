@@ -47,6 +47,12 @@ services:
     environment:
       DATABASE_URL: postgresql://relay:relay@db:5432/relay
       PYTHONUNBUFFERED: "1"
+      JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-30}
+      JOB_WORK_SECONDS: ${JOB_WORK_SECONDS:-1}
+      SIMULATED_FAILURE_RATE: ${SIMULATED_FAILURE_RATE:-0}
+    # No SIGTERM o worker termina o job se faltarem até 5s (SHUTDOWN_GRACE_SECONDS) ou o devolve para a fila;
+    # explícito porque o padrão do Docker varia (1s em algumas instalações, o que mataria o job no meio).
+    stop_grace_period: 15s
     restart: on-failure
     depends_on:
       migrate:
