@@ -219,6 +219,31 @@ perf() {
   printf '  info  GET /jobs (empresa 1 com %s jobs): %ss\n' "$(sql "SELECT count(*) FROM jobs WHERE company_id=1")" "$t"
   check "GET /jobs não faz seq scan em job_results" 0 "$((after - before))"
   check "GET /jobs responde em menos de 300 ms" 1 "$(python3 -c "print(int($t < 0.3))")"
+
+  # Percorre todas as páginas: nenhum job repetido ou pulado, mesmo com milhares de created_at iguais.
+  local walk n_seen n_unique pages slowest total
+  walk=$(python3 - "$API" <<'EOF'
+import json, sys, time, urllib.parse, urllib.request
+api, seen, cursor, pages, slowest = sys.argv[1], [], None, 0, 0.0
+while True:
+    url = f"{api}/jobs?limit=200" + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
+    started = time.monotonic()
+    page = json.load(urllib.request.urlopen(urllib.request.Request(url, headers={"X-Auth": "1:user"})))
+    slowest, pages = max(slowest, time.monotonic() - started), pages + 1
+    seen += [job["id"] for job in page["items"]]
+    cursor = page["next_cursor"]
+    if not cursor:
+        break
+print(len(seen), len(set(seen)), pages, f"{slowest:.3f}")
+EOF
+)
+  read -r n_seen n_unique pages slowest <<< "${walk:-0 0 0 99}"
+  total=$(sql "SELECT count(*) FROM jobs WHERE company_id=1")
+  printf '  info  %s páginas de até 200 jobs; página mais lenta: %ss\n' "$pages" "$slowest"
+  check "paginação percorre todos os jobs da empresa, sem repetir nem pular" "$total vistos, $total únicos" "$n_seen vistos, $n_unique únicos"
+  check "nenhuma página (inclusive as últimas) passa de 300 ms" 1 "$(python3 -c "print(int($slowest < 0.3))")"
+  check "limit acima do máximo -> 422" 422 "$(http_code "$API/jobs?limit=1000" -H 'X-Auth: 1:user')"
+  check "cursor inválido -> 422" 422 "$(http_code "$API/jobs?cursor=lixo" -H 'X-Auth: 1:user')"
 }
 
 if [ "$(http_code "$API/docs")" != "200" ]; then

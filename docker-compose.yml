@@ -36,6 +36,7 @@ services:
       DATABASE_URL: postgresql://relay:relay@db:5432/relay
       PYTHONUNBUFFERED: "1"
       CORS_ORIGINS: http://localhost:${WEB_PORT:-5173},http://127.0.0.1:${WEB_PORT:-5173}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
     # Portas só no loopback: a auth do case é um header forjável, então o alcance de rede
     # é a única barreira entre empresas.
     ports: ["127.0.0.1:${API_PORT:-8000}:8000"]

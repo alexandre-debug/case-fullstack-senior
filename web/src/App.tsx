@@ -19,7 +19,7 @@ function AdminJobs({ auth }: { auth: string }) {
       <button onClick={() => setShow(true)}>Ver todos (admin)</button>
       {show && (
         <ul>
-          {data?.map((j: any) => (
+          {data?.items?.map((j: any) => (
             <li key={j.id}>
               company {j.company_id} — {j.kind} — {j.status}
             </li>
