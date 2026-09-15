@@ -1,0 +1,4 @@
+# Scripts e SQL rodam dentro de containers Linux: força LF mesmo em clones no Windows
+# (core.autocrlf=true), onde CRLF faz o dash abortar o db/migrate.sh.
+*.sh text eol=lf
+*.sql text eol=lf
