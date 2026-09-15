@@ -202,6 +202,36 @@ def create_job(
         log("job criado", event="created", job_id=job_id, company_id=company_id, kind=body.kind)
         return {"id": job_id, "status": "queued"}
 
+# Só sai de queued/running, e só para a própria empresa. Quem grava primeiro vence a corrida com o worker:
+# se a finalização commitar antes, este UPDATE não casa e a resposta é 409; se o cancelamento commitar antes,
+# é a finalização do worker que não casa, e ele descarta o resultado sem cobrar cota.
+CANCEL_SQL = """WITH cancelled AS (
+  UPDATE jobs SET status='cancelled', finished_at=now(), lease_expires_at=NULL, updated_at=now()
+  WHERE id=%(id)s AND company_id=%(company_id)s AND status IN ('queued', 'running')
+  RETURNING id, attempts, status
+), logged AS (
+  INSERT INTO job_events (job_id, event, attempt, request_id)
+  SELECT id, 'cancelled', nullif(attempts, 0), %(request_id)s FROM cancelled
+)
+SELECT id, status FROM cancelled"""
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: int, ctx=Depends(current_ctx)):
+    company_id = ctx["company_id"]
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(CANCEL_SQL, {"id": job_id, "company_id": company_id, "request_id": request_id_var.get()})
+        row = cur.fetchone()
+        if row is None:
+            # Nada mudou: ou o job não é desta empresa (mesmo 404 de um id inexistente), ou já está em estado terminal.
+            cur.execute("SELECT status FROM jobs WHERE id=%s AND company_id=%s", (job_id, company_id))
+            current = cur.fetchone()
+            if current is None:
+                raise HTTPException(404, "not found")
+            raise HTTPException(409, f"job em {current[0]} não pode ser cancelado")
+        conn.commit()
+        log("job cancelado", event="cancelled", job_id=row[0], company_id=company_id)
+        return {"id": row[0], "status": row[1]}
+
 # Não existe papel de plataforma: o admin é da empresa e vê todos os jobs só da própria empresa.
 @app.get("/admin/jobs")
 def admin_jobs(ctx=Depends(require_admin), limit: int = PAGE_LIMIT, cursor: str | None = PAGE_CURSOR):

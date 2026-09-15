@@ -41,7 +41,8 @@ export default function App() {
 
         <h2>Jobs</h2>
         <SubmitForm auth={auth} />
-        <JobsList auth={auth} />
+        {/* key por usuário: trocar de usuário no dropdown zera erros e estado da lista */}
+        <JobsList key={auth} auth={auth} />
 
         {roleOf(auth) === "admin" && <AdminJobs auth={auth} />}
       </div>

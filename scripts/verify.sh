@@ -181,6 +181,78 @@ concurrency() {
     "$(sql "SELECT count(*) FROM pg_stat_activity WHERE datname='relay' AND state LIKE 'idle in transaction%' AND now() - xact_start > interval '5 seconds'")"
 }
 
+new_job() { # new_job <empresa> -> id
+  curl -s --max-time 30 -X POST "$API/jobs" -H "X-Auth: $1:user" -H 'Content-Type: application/json' -d "$BODY" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin).get("id", ""))'
+}
+
+cancel_call() { # cancel_call <empresa> <job> -> "<status http> <status do job>"
+  curl -s -w '|%{http_code}' --max-time 30 -X POST "$API/jobs/$2/cancel" -H "X-Auth: $1:user" | python3 -c '
+import json, sys
+body, code = sys.stdin.read().rsplit("|", 1)
+try:
+    status = json.loads(body).get("status", "")
+except ValueError:
+    status = ""
+print(code, status)'
+}
+
+wait_status() { # wait_status <job> <status> (até 30s)
+  local i
+  for i in $(seq 1 60); do
+    [ "$(sql "SELECT status FROM jobs WHERE id=$1")" = "$2" ] && return
+    sleep 0.5
+  done
+}
+
+job_state() { # job_state <job> -> "<status> <n> resultados"
+  sql "SELECT status || ' ' || (SELECT count(*) FROM job_results WHERE job_id=$1) || ' resultados' FROM jobs WHERE id=$1"
+}
+
+events_list() {
+  python3 -c 'import json, sys; print(" ".join(e["event"] for e in json.load(sys.stdin)))'
+}
+
+cancel() {
+  echo "== Cancelamento (Feature A)"
+  local job done_job quota_before quota_after
+  wait_queue
+  quota_before=$(sql "SELECT job_quota FROM companies WHERE id=2")
+
+  # Job na fila: com o worker parado, o cancelamento acontece antes de qualquer claim.
+  docker compose stop worker >/dev/null 2>&1
+  job=$(new_job 2)
+  check "cancelar job na fila -> 200 cancelled" "200 cancelled" "$(cancel_call 2 "$job")"
+  check "cancelar de novo -> 409" 409 "$(http_code -X POST "$API/jobs/$job/cancel" -H 'X-Auth: 2:user')"
+  docker compose start worker >/dev/null 2>&1
+  sleep 5
+  check "job cancelado na fila não é processado" "cancelled 0 resultados" "$(job_state "$job")"
+  check "linha do tempo do job cancelado na fila" "created cancelled" \
+    "$(curl -s --max-time 30 "$API/jobs/$job/events" -H 'X-Auth: 2:user' | events_list)"
+
+  # Job rodando: o worker precisa parar o trabalho e não finalizar.
+  job=$(new_job 2)
+  wait_status "$job" running
+  check "cancelar job rodando -> 200 cancelled" "200 cancelled" "$(cancel_call 2 "$job")"
+  sleep 6
+  check "job cancelado enquanto rodava não vira done nem grava resultado" "cancelled 0 resultados" "$(job_state "$job")"
+  check "worker registrou que parou por causa do cancelamento" 1 \
+    "$(docker compose logs --no-color --no-log-prefix worker | grep -F "\"job_id\": $job," | grep -c '"event": "cancel_observed"' | awk '{ print ($1 > 0) }')"
+  check "linha do tempo do job cancelado rodando" "created claimed cancelled" \
+    "$(curl -s --max-time 30 "$API/jobs/$job/events" -H 'X-Auth: 2:user' | events_list)"
+
+  done_job=$(sql "SELECT id FROM jobs WHERE company_id=2 AND status='done' ORDER BY id DESC LIMIT 1")
+  check "cancelar job concluído -> 409" 409 "$(http_code -X POST "$API/jobs/$done_job/cancel" -H 'X-Auth: 2:user')"
+  check "cancelar job de outra empresa -> 404" 404 "$(http_code -X POST "$API/jobs/$done_job/cancel" -H 'X-Auth: 1:user')"
+  check "job de outra empresa continua intacto" done "$(sql "SELECT status FROM jobs WHERE id=$done_job")"
+  check "cancelar job inexistente -> 404" 404 "$(http_code -X POST "$API/jobs/2147483647/cancel" -H 'X-Auth: 2:user')"
+
+  quota_after=$(sql "SELECT job_quota FROM companies WHERE id=2")
+  check "nenhum job cancelado consumiu cota" 0 "$((quota_before - quota_after))"
+  check "job cancelado libera a vaga de concorrência" 0 \
+    "$(sql "SELECT count(*) FROM jobs WHERE company_id=2 AND status IN ('queued','running')")"
+}
+
 # Espera um job terminar (até 30s).
 wait_job() {
   local i
@@ -242,6 +314,9 @@ print("ok" if lines and not bad else f"{bad} de {len(lines)} linhas não são JS
   docker compose stop worker >/dev/null 2>&1
   job_fail=$(curl -s --max-time 30 -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' \
     -H "X-Request-ID: $rid_fail" -d "$BODY" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("id", ""))' 2>/dev/null)
+  # O worker avulso pega o job mais antigo da fila, então a checagem só vale se o job de teste for o único enfileirado.
+  check "job de teste é o único na fila antes da falha controlada" "$job_fail" \
+    "$(sql "SELECT coalesce(string_agg(id::text, ','), 'nenhum') FROM jobs WHERE status='queued'")"
   run_log=$(docker compose run --rm --no-deps -T -e SIMULATED_FAILURE_RATE=1 -e JOB_WORK_SECONDS=0 worker \
     python -c 'import os, psycopg, worker; worker.process_once(psycopg.connect(os.environ["DATABASE_URL"], autocommit=True))' 2>&1)
   docker compose start worker >/dev/null 2>&1
@@ -309,17 +384,19 @@ fi
 # O verify não pode gastar a cota real das empresas: fixa uma cota alta durante a execução e restaura no fim.
 QUOTAS=$(sql "SELECT string_agg(id || ':' || job_quota, ' ') FROM companies WHERE id IN (1, 2)")
 restore_quotas() { for pair in $QUOTAS; do sql "UPDATE companies SET job_quota = ${pair#*:} WHERE id = ${pair%%:*}" >/dev/null; done; }
-trap restore_quotas EXIT
+# Algumas checagens param o worker de propósito; o trap garante que ele volte mesmo se o script for interrompido.
+trap 'restore_quotas; docker compose start worker >/dev/null 2>&1' EXIT
 sql "UPDATE companies SET job_quota = 1000000 WHERE id IN (1, 2)" >/dev/null
 
 case "${1:-all}" in
   schema) schema ;;
   security) security ;;
   concurrency) concurrency ;;
+  cancel) cancel ;;
   trace) trace ;;
   perf) perf ;;
-  all) schema; security; concurrency; trace ;;
-  *) echo "uso: $0 [schema|security|concurrency|trace|perf|all]"; exit 2 ;;
+  all) schema; security; concurrency; cancel; trace ;;
+  *) echo "uso: $0 [schema|security|concurrency|cancel|trace|perf|all]"; exit 2 ;;
 esac
 
 printf '\n%s PASS, %s FAIL\n' "$PASS" "$FAIL"

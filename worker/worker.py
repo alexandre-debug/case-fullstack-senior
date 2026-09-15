@@ -21,6 +21,7 @@ LEASE_SECONDS = env_number("JOB_LEASE_SECONDS", "30", 3, 3600)
 WORK_SECONDS = env_number("JOB_WORK_SECONDS", "1", 0, 3600)  # simula trabalho
 FAILURE_RATE = env_number("SIMULATED_FAILURE_RATE", "0", 0, 1)  # fração das tentativas que falham de propósito
 RENEW_SECONDS = LEASE_SECONDS / 3
+CANCEL_CHECK_SECONDS = 1  # com que frequência o worker confere se o job foi cancelado enquanto trabalha
 SHUTDOWN_GRACE_SECONDS = 5  # no SIGTERM: termina o job se faltar menos que isso, senão devolve para a fila
 TICK_SECONDS = 0.5
 POLL_SECONDS = 2
@@ -44,7 +45,10 @@ class Job:
         log(msg, level=level, exc_info=exc_info, job_id=self.id, company_id=self.company_id, attempt=self.attempt, request_id=self.request_id, **fields)
 
 class LostJob(Exception):
-    """Esta tentativa não é mais a dona do job (lease vencido e job re-enfileirado, ou já finalizado)."""
+    """Esta tentativa não é mais a dona do job (cancelado, lease vencido e re-enfileirado, ou já finalizado)."""
+    def __init__(self, status=None):
+        super().__init__(status or "desconhecido")
+        self.status = status
 
 class QuotaExhausted(Exception):
     pass
@@ -83,17 +87,33 @@ def renew_lease(conn, job):
     )
     return cur.rowcount == 1
 
+def still_ours(conn, job):
+    # Leitura barata (por chave primária, sem escrever) para perceber cancelamento no meio do trabalho.
+    return conn.execute(
+        "SELECT 1 FROM jobs WHERE id=%s AND status='running' AND attempts=%s", (job.id, job.attempt)
+    ).fetchone() is not None
+
+def current_status(conn, job):
+    row = conn.execute("SELECT status FROM jobs WHERE id=%s", (job.id,)).fetchone()
+    return row[0] if row else None
+
 def work(conn, job):
     start = time.monotonic()
-    next_renewal = start + RENEW_SECONDS
+    next_renewal, next_check = start + RENEW_SECONDS, start + CANCEL_CHECK_SECONDS
     while (remaining := start + WORK_SECONDS - time.monotonic()) > 0:
         if stopping and remaining > SHUTDOWN_GRACE_SECONDS:
             raise Shutdown
         time.sleep(min(remaining, TICK_SECONDS))
-        if time.monotonic() >= next_renewal:
+        now = time.monotonic()
+        if now >= next_renewal:  # renovar o lease também prova que o job ainda é desta tentativa
             if not renew_lease(conn, job):
-                raise LostJob
-            next_renewal = time.monotonic() + RENEW_SECONDS
+                raise LostJob(current_status(conn, job))
+            next_renewal, next_check = now + RENEW_SECONDS, now + CANCEL_CHECK_SECONDS
+        elif now >= next_check:
+            # Cooperação com o cancelamento: para o trabalho assim que o job deixa de ser desta tentativa.
+            if not still_ours(conn, job):
+                raise LostJob(current_status(conn, job))
+            next_check = now + CANCEL_CHECK_SECONDS
     if random.random() < FAILURE_RATE:
         raise RuntimeError("falha simulada (SIMULATED_FAILURE_RATE)")
     return f"resultado sensível da empresa {job.company_id}"
@@ -108,7 +128,7 @@ def finish(conn, job, payload):
             (job.id, job.attempt),
         ).rowcount
         if not done:
-            raise LostJob
+            raise LostJob(current_status(conn, job))
         if not conn.execute("UPDATE companies SET job_quota = job_quota - 1 WHERE id=%s AND job_quota > 0", (job.company_id,)).rowcount:
             raise QuotaExhausted
         conn.execute("INSERT INTO job_results (job_id, payload) VALUES (%s, %s)", (job.id, payload))
@@ -136,7 +156,7 @@ def fail(conn, job, error):
            )
            INSERT INTO job_events (job_id, event, attempt, request_id, detail)
            SELECT id, 'failed', attempts, request_id, %(error)s FROM failed""",
-        {"error": error.replace("\x00", "")[:2000], "id": job.id, "attempt": job.attempt},
+        {"error": error, "id": job.id, "attempt": job.attempt},
     ).rowcount == 1
 
 def release(conn, job, reason):
@@ -153,9 +173,18 @@ def release(conn, job, reason):
              SELECT id, CASE status WHEN 'queued' THEN 'released' ELSE 'failed' END, attempts, request_id, %(reason)s FROM released
            )
            SELECT status FROM released""",
-        {"reason": reason.replace("\x00", "")[:2000], "id": job.id, "attempt": job.attempt},
+        {"reason": reason, "id": job.id, "attempt": job.attempt},
     ).fetchone()
     return row[0] if row else None
+
+def persist(conn, job, action, detail):
+    # Grava o desfecho do job. Se a própria gravação falhar, o motivo original ainda fica registrado,
+    # com job, tentativa e request_id — senão a causa da falha se perderia.
+    try:
+        return action(conn, job, detail[:2000])
+    except Exception:
+        job.log("não foi possível gravar o desfecho do job", level=logging.ERROR, exc_info=True, desfecho=detail)
+        raise
 
 def recover_expired(conn):
     # Lease vencido = o worker caiu ou travou no meio do job. Volta para a fila se ainda há tentativas, senão failed.
@@ -197,25 +226,31 @@ def process_once(conn):
     try:
         finish_with_retry(conn, job, work(conn, job))
         job.log("job concluído", event="completed", duration_ms=round((time.monotonic() - started) * 1000))
-    except LostJob:
-        job.log("tentativa não é mais a atual; resultado descartado", level=logging.WARNING, event="lost")
+    except LostJob as lost:
+        if lost.status == "cancelled":
+            job.log("job cancelado: trabalho interrompido, nada gravado nem cobrado", level=logging.WARNING, event="cancel_observed")
+        else:
+            job.log("tentativa não é mais a atual; resultado descartado", level=logging.WARNING, event="lost", job_status=lost.status)
     except Shutdown:
-        status = release(conn, job, f"worker encerrado durante a tentativa {job.attempt}")
-        job.log("job devolvido: worker encerrando", level=logging.WARNING, event="released", new_status=status)
+        status = persist(conn, job, release, f"worker encerrado durante a tentativa {job.attempt}")
+        job.log("job devolvido: worker encerrando", level=logging.WARNING, event="released" if status else "lost", new_status=status)
     except QuotaExhausted:
-        fail(conn, job, "cota de jobs esgotada na conclusão")
-        job.log("job falhou: cota esgotada na conclusão", level=logging.ERROR, event="failed")
+        applied = persist(conn, job, fail, "cota de jobs esgotada na conclusão")
+        job.log("job falhou: cota esgotada na conclusão", level=logging.ERROR, event="failed" if applied else "lost")
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        # Só a primeira linha vai para o banco: DETAIL/CONTEXT do Postgres (tabelas, ctid, PIDs) ficam no log,
+        # que é interno, e não em last_error, que o cliente lê.
+        detail = f"{type(exc).__name__}: {(str(exc).splitlines() or [''])[0]}"
         if conn.closed or conn.broken:
-            job.log("conexão perdida durante o job; o lease vai devolvê-lo", level=logging.WARNING, event="connection_lost", error=error)
+            job.log("conexão perdida durante o job; o lease vai devolvê-lo", level=logging.WARNING, event="connection_lost", error=detail)
             raise
         if isinstance(exc, TRANSIENT_ERRORS):
-            status = release(conn, job, f"erro transitório do banco na tentativa {job.attempt}: {exc}")
-            job.log("job devolvido: erro transitório do banco", level=logging.WARNING, event="released", new_status=status, error=error)
+            status = persist(conn, job, release, f"erro transitório do banco na tentativa {job.attempt}: {detail}")
+            job.log("job devolvido: erro transitório do banco", level=logging.WARNING, exc_info=True,
+                    event="released" if status else "lost", new_status=status, error=detail)
         else:
-            fail(conn, job, error)
-            job.log("job falhou", level=logging.ERROR, exc_info=True, event="failed", error=error)
+            applied = persist(conn, job, fail, detail)
+            job.log("job falhou", level=logging.ERROR, exc_info=True, event="failed" if applied else "lost", error=detail)
     return True
 
 def main():
