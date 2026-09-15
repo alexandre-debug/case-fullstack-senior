@@ -94,7 +94,7 @@ def decode_cursor(cursor: str) -> tuple[datetime, int]:
 # (created_at, id): cada página é um range em jobs_company_created_idx, com custo proporcional ao tamanho da
 # página, não ao total de jobs nem à profundidade (com OFFSET, cada página seria mais lenta que a anterior).
 # O id desempata created_at iguais (inserts em lote gravam o mesmo now() em vários jobs).
-JOBS_PAGE_SQL = """SELECT j.id, j.company_id, j.kind, j.status, j.created_at,
+JOBS_PAGE_SQL = """SELECT j.id, j.company_id, j.kind, j.status, j.created_at, j.attempts, j.max_attempts, j.last_error,
        (SELECT count(*) FROM job_results r WHERE r.job_id = j.id)
 FROM jobs j
 WHERE j.company_id = %(company_id)s {after}
@@ -121,7 +121,13 @@ PAGE_CURSOR = Query(None, min_length=1, max_length=200)
 def list_jobs(ctx=Depends(current_ctx), limit: int = PAGE_LIMIT, cursor: str | None = PAGE_CURSOR):
     rows, next_cursor = jobs_page(ctx["company_id"], limit, cursor)
     return {
-        "items": [{"id": r[0], "kind": r[2], "status": r[3], "created_at": r[4].isoformat(), "result_count": r[5]} for r in rows],
+        "items": [
+            {
+                "id": r[0], "kind": r[2], "status": r[3], "created_at": r[4].isoformat(),
+                "attempts": r[5], "max_attempts": r[6], "last_error": r[7], "result_count": r[8],
+            }
+            for r in rows
+        ],
         "next_cursor": next_cursor,
     }
 
@@ -231,6 +237,48 @@ def cancel_job(job_id: int, ctx=Depends(current_ctx)):
         conn.commit()
         log("job cancelado", event="cancelled", job_id=row[0], company_id=company_id)
         return {"id": row[0], "status": row[1]}
+
+# failed -> queued só acontece uma vez: dois cliques simultâneos disputam a mesma linha e o segundo não casa
+# mais o WHERE (409). attempts nunca é zerado, então o limite de tentativas continua valendo, e o CHECK
+# jobs_queued_attempts_check garante no banco que nenhum job volta para a fila sem tentativa sobrando.
+RETRY_SQL = """WITH retried AS (
+  UPDATE jobs SET status='queued', finished_at=NULL, lease_expires_at=NULL, updated_at=now()
+  WHERE id=%(id)s AND company_id=%(company_id)s AND status='failed' AND attempts < max_attempts
+  RETURNING id, attempts, max_attempts
+), logged AS (
+  INSERT INTO job_events (job_id, event, attempt, request_id, detail)
+  SELECT id, 'retried', attempts, %(request_id)s, 'reprocessamento solicitado' FROM retried
+)
+SELECT id, attempts FROM retried"""
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: int, ctx=Depends(current_ctx)):
+    company_id = ctx["company_id"]
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(RETRY_SQL, {"id": job_id, "company_id": company_id, "request_id": request_id_var.get()})
+        row = cur.fetchone()
+        if row is None:
+            cur.execute("SELECT status, max_attempts FROM jobs WHERE id=%s AND company_id=%s", (job_id, company_id))
+            current = cur.fetchone()
+            if current is None:
+                raise HTTPException(404, "not found")
+            if current[0] != "failed":
+                raise HTTPException(409, f"job em {current[0]} não pode ser reprocessado")
+            raise HTTPException(409, f"job esgotou as {current[1]} tentativas")
+        job_id, attempts = row
+        # Voltar para a fila passa pela mesma admissão de um job novo (ordem de locks job -> empresa):
+        # o retry não fura o limite de concorrência nem a cota. O job já conta como ativo aqui, daí o ">".
+        cur.execute("SELECT max_concurrent_jobs, job_quota FROM companies WHERE id=%s FOR NO KEY UPDATE", (company_id,))
+        limit, quota = cur.fetchone()
+        cur.execute("SELECT count(*) FROM jobs WHERE company_id=%s AND status IN ('queued','running')", (company_id,))
+        active = cur.fetchone()[0]
+        if active > limit:
+            raise HTTPException(429, "limite de jobs concorrentes atingido")
+        if active > quota:
+            raise HTTPException(402, "cota restante já reservada para os jobs em andamento")
+        conn.commit()
+        log("job reprocessado", event="retried", job_id=job_id, company_id=company_id, attempts=attempts)
+        return {"id": job_id, "status": "queued", "attempts": attempts}
 
 # Não existe papel de plataforma: o admin é da empresa e vê todos os jobs só da própria empresa.
 @app.get("/admin/jobs")

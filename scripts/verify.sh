@@ -253,6 +253,62 @@ cancel() {
     "$(sql "SELECT count(*) FROM jobs WHERE company_id=2 AND status IN ('queued','running')")"
 }
 
+fail_job() { # fail_job <empresa> <request id> -> id de um job em failed (falha simulada com o código real do worker)
+  local job
+  wait_queue
+  docker compose stop worker >/dev/null 2>&1
+  job=$(curl -s --max-time 30 -X POST "$API/jobs" -H "X-Auth: $1:user" -H 'Content-Type: application/json' \
+    -H "X-Request-ID: $2" -d "$BODY" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("id", ""))')
+  docker compose run --rm --no-deps -T -e SIMULATED_FAILURE_RATE=1 -e JOB_WORK_SECONDS=0 worker \
+    python -c 'import os, psycopg, worker; worker.process_once(psycopg.connect(os.environ["DATABASE_URL"], autocommit=True))' >/dev/null 2>&1
+  docker compose start worker >/dev/null 2>&1
+  echo "$job"
+}
+
+retry() {
+  echo "== Reprocessamento (Feature B)"
+  local job outro_a outro_b quota_before respostas
+  quota_before=$(sql "SELECT job_quota FROM companies WHERE id=2")
+  job=$(fail_job 2 "verify-retry-$$")
+  check "job de teste ficou failed com motivo" "failed com last_error" \
+    "$(sql "SELECT status || CASE WHEN last_error IS NULL THEN ' sem last_error' ELSE ' com last_error' END FROM jobs WHERE id=$job")"
+
+  # Duplo clique: 5 retries simultâneos e só um pode reprocessar.
+  respostas=$(seq 5 | xargs -P 5 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time 30 \
+    -X POST "$API/jobs/$job/retry" -H 'X-Auth: 2:user' | sort | uniq -c | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//; s/ *$//')
+  check "5 retries simultâneos: 1 aceito, 4 recusados" "1 200 4 409" "$respostas"
+  check "um único evento retried" 1 "$(sql "SELECT count(*) FROM job_events WHERE job_id=$job AND event='retried'")"
+  wait_job "$job"
+  check "reprocessamento conclui com um único resultado" "done 1 resultados" "$(job_state "$job")"
+  check "cota cobrada uma única vez no ciclo (falha + retry)" 1 \
+    "$((quota_before - $(sql "SELECT job_quota FROM companies WHERE id=2")))"
+  check "linha do tempo do reprocessamento" "created claimed failed retried claimed completed" \
+    "$(curl -s --max-time 30 "$API/jobs/$job/events" -H 'X-Auth: 2:user' | events_list)"
+  check "retry de job concluído -> 409" 409 "$(http_code -X POST "$API/jobs/$job/retry" -H 'X-Auth: 2:user')"
+  check "retry de job de outra empresa -> 404" 404 "$(http_code -X POST "$API/jobs/$job/retry" -H 'X-Auth: 1:user')"
+
+  # Tentativas esgotadas.
+  job=$(fail_job 2 "verify-retry-max-$$")
+  sql "UPDATE jobs SET attempts = max_attempts WHERE id=$job" >/dev/null
+  check "retry com tentativas esgotadas -> 409" 409 "$(http_code -X POST "$API/jobs/$job/retry" -H 'X-Auth: 2:user')"
+  check "job continua failed" failed "$(sql "SELECT status FROM jobs WHERE id=$job")"
+
+  # O retry passa pela mesma admissão de um job novo: limite de concorrência e cota valem igual.
+  job=$(fail_job 2 "verify-retry-limite-$$")
+  docker compose stop worker >/dev/null 2>&1
+  outro_a=$(new_job 2); outro_b=$(new_job 2)
+  check "retry com o limite de concorrência cheio -> 429" 429 "$(http_code -X POST "$API/jobs/$job/retry" -H 'X-Auth: 2:user')"
+  cancel_call 2 "$outro_a" >/dev/null; cancel_call 2 "$outro_b" >/dev/null
+  sql "UPDATE companies SET job_quota = 0 WHERE id=2" >/dev/null
+  check "retry sem cota -> 402" 402 "$(http_code -X POST "$API/jobs/$job/retry" -H 'X-Auth: 2:user')"
+  sql "UPDATE companies SET job_quota = 1000000 WHERE id=2" >/dev/null
+  check "job continua failed depois dos 429/402" failed "$(sql "SELECT status FROM jobs WHERE id=$job")"
+  docker compose start worker >/dev/null 2>&1
+  check "retry funciona quando há vaga e cota" 200 "$(http_code -X POST "$API/jobs/$job/retry" -H 'X-Auth: 2:user')"
+  wait_job "$job"
+  check "job reprocessado conclui com um único resultado" "done 1 resultados" "$(job_state "$job")"
+}
+
 # Espera um job terminar (até 30s).
 wait_job() {
   local i
@@ -393,10 +449,11 @@ case "${1:-all}" in
   security) security ;;
   concurrency) concurrency ;;
   cancel) cancel ;;
+  retry) retry ;;
   trace) trace ;;
   perf) perf ;;
-  all) schema; security; concurrency; cancel; trace ;;
-  *) echo "uso: $0 [schema|security|concurrency|cancel|trace|perf|all]"; exit 2 ;;
+  all) schema; security; concurrency; cancel; retry; trace ;;
+  *) echo "uso: $0 [schema|security|concurrency|cancel|retry|trace|perf|all]"; exit 2 ;;
 esac
 
 printf '\n%s PASS, %s FAIL\n' "$PASS" "$FAIL"
