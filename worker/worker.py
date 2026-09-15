@@ -1,7 +1,10 @@
-import os, random, signal, sys, time, traceback
+import logging, os, random, signal, sys, time
 from dataclasses import dataclass
 import psycopg
 from psycopg import errors
+from logging_setup import configure_logging, log
+
+configure_logging()
 
 def env_number(name, default, minimum, maximum):
     raw = os.environ.get(name, default)
@@ -10,7 +13,8 @@ def env_number(name, default, minimum, maximum):
     except ValueError:
         value = float("nan")
     if not minimum <= value <= maximum:  # também recusa nan
-        sys.exit(f"configuração inválida: {name}={raw!r} (use um número entre {minimum} e {maximum})")
+        log("configuração inválida", level=logging.CRITICAL, variable=name, value=raw, minimum=minimum, maximum=maximum)
+        sys.exit(2)
     return value
 
 LEASE_SECONDS = env_number("JOB_LEASE_SECONDS", "30", 3, 3600)
@@ -34,6 +38,10 @@ class Job:
     company_id: int
     kind: str
     attempt: int
+    request_id: str | None  # da requisição que criou o job: liga este log ao log da API
+
+    def log(self, msg, level=logging.INFO, exc_info=None, **fields):
+        log(msg, level=level, exc_info=exc_info, job_id=self.id, company_id=self.company_id, attempt=self.attempt, request_id=self.request_id, **fields)
 
 class LostJob(Exception):
     """Esta tentativa não é mais a dona do job (lease vencido e job re-enfileirado, ou já finalizado)."""
@@ -48,15 +56,23 @@ def request_stop(signum, frame):
     global stopping
     stopping = True
 
+# Toda mudança de estado grava o evento correspondente em job_events na mesma instrução ou transação,
+# então a linha do tempo nunca diverge do status do job.
+
 def claim(conn):
     # SELECT + UPDATE numa única instrução, com SKIP LOCKED: dois workers nunca pegam o mesmo job.
     # O prazo do lease fica gravado na linha, então réplicas com JOB_LEASE_SECONDS diferentes não roubam jobs vivos.
     row = conn.execute(
-        """UPDATE jobs SET status='running', attempts=attempts+1, started_at=now(), updated_at=now(),
-                  lease_expires_at = now() + make_interval(secs => %s)
-           WHERE id = (SELECT id FROM jobs WHERE status='queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
-           RETURNING id, company_id, kind, attempts""",
-        (LEASE_SECONDS,),
+        """WITH claimed AS (
+             UPDATE jobs SET status='running', attempts=attempts+1, started_at=now(), updated_at=now(),
+                    lease_expires_at = now() + make_interval(secs => %(lease)s)
+             WHERE id = (SELECT id FROM jobs WHERE status='queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+             RETURNING id, company_id, kind, attempts, request_id
+           ), logged AS (
+             INSERT INTO job_events (job_id, event, attempt, request_id) SELECT id, 'claimed', attempts, request_id FROM claimed
+           )
+           SELECT id, company_id, kind, attempts, request_id FROM claimed""",
+        {"lease": LEASE_SECONDS},
     ).fetchone()
     return Job(*row) if row else None
 
@@ -83,7 +99,7 @@ def work(conn, job):
     return f"resultado sensível da empresa {job.company_id}"
 
 def finish(conn, job, payload):
-    # Resultado, cobrança e status numa transação, e só se o job ainda é desta tentativa (status + attempts):
+    # Resultado, cobrança, status e evento numa transação, e só se o job ainda é desta tentativa (status + attempts):
     # uma tentativa antiga ou repetida não grava resultado nem cobra cota. Ordem de locks: job -> empresa.
     with conn.transaction():
         done = conn.execute(
@@ -96,6 +112,10 @@ def finish(conn, job, payload):
         if not conn.execute("UPDATE companies SET job_quota = job_quota - 1 WHERE id=%s AND job_quota > 0", (job.company_id,)).rowcount:
             raise QuotaExhausted
         conn.execute("INSERT INTO job_results (job_id, payload) VALUES (%s, %s)", (job.id, payload))
+        conn.execute(
+            "INSERT INTO job_events (job_id, event, attempt, request_id) VALUES (%s, 'completed', %s, %s)",
+            (job.id, job.attempt, job.request_id),
+        )
 
 def finish_with_retry(conn, job, payload):
     # finish é idempotente pelo fencing, então repetir depois de deadlock ou lock_timeout é seguro.
@@ -108,21 +128,34 @@ def finish_with_retry(conn, job, payload):
             time.sleep(0.2 * attempt)
 
 def fail(conn, job, error):
-    conn.execute(
-        """UPDATE jobs SET status='failed', finished_at=now(), lease_expires_at=NULL, last_error=%s, updated_at=now()
-           WHERE id=%s AND status='running' AND attempts=%s""",
-        (error.replace("\x00", "")[:2000], job.id, job.attempt),
-    )
+    return conn.execute(
+        """WITH failed AS (
+             UPDATE jobs SET status='failed', finished_at=now(), lease_expires_at=NULL, last_error=%(error)s, updated_at=now()
+             WHERE id=%(id)s AND status='running' AND attempts=%(attempt)s
+             RETURNING id, attempts, request_id
+           )
+           INSERT INTO job_events (job_id, event, attempt, request_id, detail)
+           SELECT id, 'failed', attempts, request_id, %(error)s FROM failed""",
+        {"error": error.replace("\x00", "")[:2000], "id": job.id, "attempt": job.attempt},
+    ).rowcount == 1
 
 def release(conn, job, reason):
     # Devolve o job agora em vez de esperar o lease vencer: mesma regra do reaper, condicionada a esta tentativa.
-    conn.execute(
-        """UPDATE jobs SET status = CASE WHEN attempts < max_attempts THEN 'queued' ELSE 'failed' END,
-                  finished_at = CASE WHEN attempts < max_attempts THEN NULL ELSE now() END,
-                  lease_expires_at = NULL, last_error = %s, updated_at = now()
-           WHERE id=%s AND status='running' AND attempts=%s""",
-        (reason.replace("\x00", "")[:2000], job.id, job.attempt),
-    )
+    row = conn.execute(
+        """WITH released AS (
+             UPDATE jobs SET status = CASE WHEN attempts < max_attempts THEN 'queued' ELSE 'failed' END,
+                    finished_at = CASE WHEN attempts < max_attempts THEN NULL ELSE now() END,
+                    lease_expires_at = NULL, last_error = %(reason)s, updated_at = now()
+             WHERE id=%(id)s AND status='running' AND attempts=%(attempt)s
+             RETURNING id, attempts, request_id, status
+           ), logged AS (
+             INSERT INTO job_events (job_id, event, attempt, request_id, detail)
+             SELECT id, CASE status WHEN 'queued' THEN 'released' ELSE 'failed' END, attempts, request_id, %(reason)s FROM released
+           )
+           SELECT status FROM released""",
+        {"reason": reason.replace("\x00", "")[:2000], "id": job.id, "attempt": job.attempt},
+    ).fetchone()
+    return row[0] if row else None
 
 def recover_expired(conn):
     # Lease vencido = o worker caiu ou travou no meio do job. Volta para a fila se ainda há tentativas, senão failed.
@@ -132,47 +165,57 @@ def recover_expired(conn):
         """WITH expired AS (
              SELECT id FROM jobs
              WHERE status='running'
-               AND (lease_expires_at < now() OR (lease_expires_at IS NULL AND updated_at < now() - make_interval(secs => %s)))
+               AND (lease_expires_at < now() OR (lease_expires_at IS NULL AND updated_at < now() - make_interval(secs => %(lease)s)))
              ORDER BY id FOR UPDATE SKIP LOCKED
+           ), recovered AS (
+             UPDATE jobs j
+             SET status = CASE WHEN j.attempts < j.max_attempts THEN 'queued' ELSE 'failed' END,
+                 finished_at = CASE WHEN j.attempts < j.max_attempts THEN NULL ELSE now() END,
+                 lease_expires_at = NULL,
+                 last_error = 'lease vencido: o worker parou de responder na tentativa ' || j.attempts,
+                 updated_at = now()
+             FROM expired WHERE j.id = expired.id
+             RETURNING j.id, j.company_id, j.kind, j.attempts, j.request_id, j.status, j.last_error
+           ), logged AS (
+             INSERT INTO job_events (job_id, event, attempt, request_id, detail)
+             SELECT id, CASE status WHEN 'queued' THEN 'lease_expired' ELSE 'failed' END, attempts, request_id, last_error FROM recovered
            )
-           UPDATE jobs j
-           SET status = CASE WHEN j.attempts < j.max_attempts THEN 'queued' ELSE 'failed' END,
-               finished_at = CASE WHEN j.attempts < j.max_attempts THEN NULL ELSE now() END,
-               lease_expires_at = NULL,
-               last_error = 'lease vencido: o worker parou de responder na tentativa ' || j.attempts,
-               updated_at = now()
-           FROM expired WHERE j.id = expired.id
-           RETURNING j.id, j.status""",
-        (LEASE_SECONDS,),
+           SELECT id, company_id, kind, attempts, request_id, status FROM recovered""",
+        {"lease": LEASE_SECONDS},
     ).fetchall()
-    for job_id, status in rows:
-        print(f"job {job_id}: lease vencido, agora {status}")
+    for job_id, company_id, kind, attempt, request_id, status in rows:
+        Job(job_id, company_id, kind, attempt, request_id).log(
+            "lease vencido: o worker parou de responder", level=logging.WARNING, event="lease_expired", new_status=status
+        )
 
 def process_once(conn):
     job = claim(conn)
     if job is None:
         return False
-    print(f"processando job {job.id} (empresa {job.company_id}, tentativa {job.attempt})")
+    job.log("job pego", event="claimed")
+    started = time.monotonic()
     try:
         finish_with_retry(conn, job, work(conn, job))
-        print(f"job {job.id} concluído")
+        job.log("job concluído", event="completed", duration_ms=round((time.monotonic() - started) * 1000))
     except LostJob:
-        print(f"job {job.id}: a tentativa {job.attempt} não é mais a atual; resultado descartado")
+        job.log("tentativa não é mais a atual; resultado descartado", level=logging.WARNING, event="lost")
     except Shutdown:
-        release(conn, job, f"worker encerrado durante a tentativa {job.attempt}")
-        print(f"job {job.id} devolvido: worker encerrando")
+        status = release(conn, job, f"worker encerrado durante a tentativa {job.attempt}")
+        job.log("job devolvido: worker encerrando", level=logging.WARNING, event="released", new_status=status)
     except QuotaExhausted:
         fail(conn, job, "cota de jobs esgotada na conclusão")
-        print(f"job {job.id} falhou: cota esgotada")
+        job.log("job falhou: cota esgotada na conclusão", level=logging.ERROR, event="failed")
     except Exception as exc:
-        if conn.broken:
-            raise  # conexão perdida: o lease vence e o job é recuperado
+        error = f"{type(exc).__name__}: {exc}"
+        if conn.closed or conn.broken:
+            job.log("conexão perdida durante o job; o lease vai devolvê-lo", level=logging.WARNING, event="connection_lost", error=error)
+            raise
         if isinstance(exc, TRANSIENT_ERRORS):
-            release(conn, job, f"erro transitório do banco na tentativa {job.attempt}: {exc}")
-            print(f"job {job.id} devolvido: {exc}")
+            status = release(conn, job, f"erro transitório do banco na tentativa {job.attempt}: {exc}")
+            job.log("job devolvido: erro transitório do banco", level=logging.WARNING, event="released", new_status=status, error=error)
         else:
-            fail(conn, job, f"{type(exc).__name__}: {exc}")
-            print(f"job {job.id} falhou:\n{traceback.format_exc()}")
+            fail(conn, job, error)
+            job.log("job falhou", level=logging.ERROR, exc_info=True, event="failed", error=error)
     return True
 
 def main():
@@ -184,7 +227,7 @@ def main():
                 # autocommit: fora de conn.transaction() cada comando fecha a própria transação, então o
                 # worker não fica "idle in transaction" segurando lock em jobs (o que travava ALTER TABLE).
                 conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True, options=DB_OPTIONS)
-                print("worker conectado")
+                log("worker conectado", lease_seconds=LEASE_SECONDS, work_seconds=WORK_SECONDS, failure_rate=FAILURE_RATE)
             if time.monotonic() >= next_recovery:
                 recover_expired(conn)
                 next_recovery = time.monotonic() + RECOVER_EVERY_SECONDS
@@ -195,14 +238,14 @@ def main():
             # Conexão perdida: reconecta, e o lease cobre o job que estava em andamento.
             # Erro com a conexão viva (ex.: lock_timeout no claim durante uma migração): tenta de novo nela mesma.
             if conn is None or conn.closed or conn.broken:
-                print(f"conexão com o banco indisponível ({exc}); tentando de novo em {POLL_SECONDS}s")
+                log("conexão com o banco indisponível", level=logging.WARNING, error=str(exc), retry_in_seconds=POLL_SECONDS)
             elif isinstance(exc, TRANSIENT_ERRORS):
-                print(f"erro transitório do banco ({exc}); tentando de novo em {POLL_SECONDS}s")
+                log("erro transitório do banco", level=logging.WARNING, error=str(exc), retry_in_seconds=POLL_SECONDS)
             else:
-                print(f"erro inesperado; tentando de novo em {POLL_SECONDS}s\n{traceback.format_exc()}")
+                log("erro inesperado no loop do worker", level=logging.ERROR, exc_info=True, retry_in_seconds=POLL_SECONDS)
             time.sleep(POLL_SECONDS)
     if conn is not None:
         conn.close()
-    print("worker encerrado")
+    log("worker encerrado")
 
 if __name__ == "__main__": main()

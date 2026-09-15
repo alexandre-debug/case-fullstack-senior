@@ -1,8 +1,8 @@
-import base64, os
+import base64, logging, os, re, time, uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Literal
-from fastapi import FastAPI, Depends, Header, HTTPException, Query
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
@@ -11,9 +11,12 @@ from psycopg_pool import PoolTimeout
 from pydantic import BaseModel
 from auth import current_ctx, require_admin
 from db import get_conn, pool
-from logging_setup import log
+from logging_setup import configure_logging, log, request_id_var
+
+configure_logging()
 
 PAGE_SIZE_MAX = 200
+REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 def env_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
@@ -27,12 +30,39 @@ async def lifespan(app):
 app = FastAPI(title="Relay", lifespan=lifespan)
 # Host fora da lista responde 400: impede DNS rebinding, que chegaria à API como mesma origem e passaria por fora do CORS.
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=env_list("ALLOWED_HOSTS", "localhost,127.0.0.1"))
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    # Aceita o X-Request-ID do cliente, se for seguro para log, ou gera um. Ele volta no header da resposta,
+    # entra em toda linha de log desta requisição e é gravado no job, para o worker logar com o mesmo id.
+    incoming = request.headers.get("x-request-id", "")
+    request_id = incoming if REQUEST_ID.fullmatch(incoming) else uuid.uuid4().hex
+    token = request_id_var.set(request_id)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        log("erro não tratado", level=logging.ERROR, exc_info=True, method=request.method, path=request.url.path)
+        response = JSONResponse({"detail": "erro interno", "request_id": request_id}, status_code=500)
+    response.headers["X-Request-ID"] = request_id
+    log(
+        "request",
+        method=request.method,
+        path=request.url.path,
+        status=response.status_code,
+        duration_ms=round((time.perf_counter() - started) * 1000, 1),
+        company_id=getattr(request.state, "company_id", None),
+    )
+    request_id_var.reset(token)
+    return response
+
 # Só a origem da web UI. Defesa em profundidade: a auth é por header, que o navegador não envia sozinho.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=env_list("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"),
     allow_methods=["GET", "POST"],
-    allow_headers=["X-Auth", "Content-Type", "Idempotency-Key"],
+    allow_headers=["X-Auth", "Content-Type", "Idempotency-Key", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
 )
 
 # Nos dois casos (db.py) é melhor pedir nova tentativa do que empilhar threads esperando.
@@ -75,20 +105,20 @@ NEXT_PAGE_SQL = JOBS_PAGE_SQL.format(after="AND (j.created_at, j.id) < (%(create
 
 def jobs_page(company_id: int, limit: int, cursor: str | None):
     params = {"company_id": company_id, "limit": limit + 1}
-    if cursor:
+    if cursor is not None:
         params["created_at"], params["id"] = decode_cursor(cursor)
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(NEXT_PAGE_SQL if cursor else FIRST_PAGE_SQL, params)
+        cur.execute(NEXT_PAGE_SQL if cursor is not None else FIRST_PAGE_SQL, params)
         rows = cur.fetchall()
     next_cursor = encode_cursor(rows[limit - 1][4], rows[limit - 1][0]) if len(rows) > limit else None
     return rows[:limit], next_cursor
 
+# cursor vazio é 422, não primeira página: senão um cliente que monte "cursor=" no fim da lista entraria em loop.
+PAGE_LIMIT = Query(50, ge=1, le=PAGE_SIZE_MAX)
+PAGE_CURSOR = Query(None, min_length=1, max_length=200)
+
 @app.get("/jobs")
-def list_jobs(
-    ctx=Depends(current_ctx),
-    limit: int = Query(50, ge=1, le=PAGE_SIZE_MAX),
-    cursor: str | None = Query(None, max_length=200),
-):
+def list_jobs(ctx=Depends(current_ctx), limit: int = PAGE_LIMIT, cursor: str | None = PAGE_CURSOR):
     rows, next_cursor = jobs_page(ctx["company_id"], limit, cursor)
     return {
         "items": [{"id": r[0], "kind": r[2], "status": r[3], "created_at": r[4].isoformat(), "result_count": r[5]} for r in rows],
@@ -98,13 +128,24 @@ def list_jobs(
 # Nas rotas por id, o company_id vai no WHERE: job de outra empresa responde o mesmo 404 de um id inexistente.
 # Os ids continuam sequenciais e globais, então ainda dá para inferir o volume de jobs de outras empresas
 # (aceito conscientemente; ids opacos ficaram fora do escopo).
+JOB_FIELDS = ("id", "company_id", "kind", "status", "attempts", "max_attempts", "last_error", "request_id", "created_at", "started_at", "finished_at")
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: int, ctx=Depends(current_ctx)):
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, company_id, kind, status FROM jobs WHERE id=%s AND company_id=%s", (job_id, ctx["company_id"]))
+        cur.execute(f"SELECT {', '.join(JOB_FIELDS)} FROM jobs WHERE id=%s AND company_id=%s", (job_id, ctx["company_id"]))
         row = cur.fetchone()
         if not row: raise HTTPException(404, "not found")
-        return {"id": row[0], "company_id": row[1], "kind": row[2], "status": row[3]}
+        return dict(zip(JOB_FIELDS, row))
+
+@app.get("/jobs/{job_id}/events")
+def get_job_events(job_id: int, ctx=Depends(current_ctx)):
+    # Linha do tempo do job: qual requisição o criou, cada tentativa e por que falhou ou voltou para a fila.
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM jobs WHERE id=%s AND company_id=%s", (job_id, ctx["company_id"]))
+        if cur.fetchone() is None: raise HTTPException(404, "not found")
+        cur.execute("SELECT event, attempt, request_id, detail, created_at FROM job_events WHERE job_id=%s ORDER BY id", (job_id,))
+        return [dict(zip(("event", "attempt", "request_id", "detail", "created_at"), r)) for r in cur.fetchall()]
 
 @app.get("/jobs/{job_id}/result")
 def get_result(job_id: int, ctx=Depends(current_ctx)):
@@ -126,6 +167,7 @@ def create_job(
     idempotency_key: str | None = Header(default=None, min_length=1, max_length=128),
 ):
     company_id = ctx["company_id"]
+    request_id = request_id_var.get()
     with get_conn() as conn, conn.cursor() as cur:
         # Trava a linha da empresa: admissões da mesma empresa passam uma de cada vez, então a contagem
         # continua válida até o INSERT (antes, count e insert soltos deixavam 20 POSTs criarem 7 jobs com limite 2).
@@ -138,6 +180,7 @@ def create_job(
             if existing:
                 if existing[2] != body.kind:
                     raise HTTPException(422, "Idempotency-Key já usada com outro payload")
+                log("job reaproveitado pela Idempotency-Key", event="replayed", job_id=existing[0], company_id=company_id)
                 return {"id": existing[0], "status": existing[1]}
         if quota <= 0:
             raise HTTPException(402, "cota de jobs esgotada")
@@ -150,20 +193,17 @@ def create_job(
         if active >= quota:
             raise HTTPException(402, "cota restante já reservada para os jobs em andamento")
         cur.execute(
-            "INSERT INTO jobs (company_id, kind, status, idempotency_key) VALUES (%s,%s,'queued',%s) RETURNING id",
-            (company_id, body.kind, idempotency_key),
+            "INSERT INTO jobs (company_id, kind, status, idempotency_key, request_id) VALUES (%s,%s,'queued',%s,%s) RETURNING id",
+            (company_id, body.kind, idempotency_key, request_id),
         )
         job_id = cur.fetchone()[0]
+        cur.execute("INSERT INTO job_events (job_id, event, request_id) VALUES (%s, 'created', %s)", (job_id, request_id))
         conn.commit()
-        log(f"job criado id={job_id} company={company_id} kind={body.kind}")
+        log("job criado", event="created", job_id=job_id, company_id=company_id, kind=body.kind)
         return {"id": job_id, "status": "queued"}
 
 # Não existe papel de plataforma: o admin é da empresa e vê todos os jobs só da própria empresa.
 @app.get("/admin/jobs")
-def admin_jobs(
-    ctx=Depends(require_admin),
-    limit: int = Query(50, ge=1, le=PAGE_SIZE_MAX),
-    cursor: str | None = Query(None, max_length=200),
-):
+def admin_jobs(ctx=Depends(require_admin), limit: int = PAGE_LIMIT, cursor: str | None = PAGE_CURSOR):
     rows, next_cursor = jobs_page(ctx["company_id"], limit, cursor)
     return {"items": [{"id": r[0], "company_id": r[1], "kind": r[2], "status": r[3]} for r in rows], "next_cursor": next_cursor}

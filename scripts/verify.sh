@@ -181,9 +181,28 @@ concurrency() {
     "$(sql "SELECT count(*) FROM pg_stat_activity WHERE datname='relay' AND state LIKE 'idle in transaction%' AND now() - xact_start > interval '5 seconds'")"
 }
 
+# Espera um job terminar (até 30s).
+wait_job() {
+  local i
+  for i in $(seq 1 30); do
+    [ "$(sql "SELECT status IN ('done', 'failed', 'cancelled') FROM jobs WHERE id::text='$1'")" = "t" ] && return
+    sleep 1
+  done
+}
+
+# Resume GET /jobs/{id}/events como "evento:request_id ...".
+events_summary() {
+  python3 -c '
+import json, sys
+try:
+    print(" ".join(e["event"] + ":" + str(e["request_id"]) for e in json.load(sys.stdin)))
+except Exception as exc:
+    print("resposta inválida:", exc)'
+}
+
 trace() {
   echo "== Rastreabilidade (Sintoma 3)"
-  local rid resp job i
+  local rid resp job
   rid="verify-$$-$(date +%s)"
   wait_queue
   resp=$(curl -s -i --max-time 30 -X POST "$API/jobs" -H 'X-Auth: 2:user' \
@@ -192,14 +211,50 @@ trace() {
     "$(printf '%s\n' "$resp" | awk 'tolower($1) == "x-request-id:" { print $2 }')"
   job=$(printf '%s\n' "$resp" | tail -n 1 | python3 -c 'import json, sys; print(json.load(sys.stdin).get("id", ""))' 2>/dev/null)
   job=${job:-sem-job}
-  for i in $(seq 1 30); do
-    [ "$(sql "SELECT status IN ('done', 'failed', 'cancelled') FROM jobs WHERE id::text='$job'")" = "t" ] && break
-    sleep 1
-  done
+  wait_job "$job"
   check "log da API contém o request id" 1 \
     "$(docker compose logs --no-color api | grep -c -- "$rid" | awk '{ print ($1 > 0) }')"
   check "log do worker liga o request id ao job $job" 1 \
-    "$(docker compose logs --no-color worker | grep -- "$rid" | grep -c -- "$job" | awk '{ print ($1 > 0) }')"
+    "$(docker compose logs --no-color worker | grep -- "$rid" | grep -c -- "\"job_id\": $job," | awk '{ print ($1 > 0) }')"
+  check "linha do tempo do job: created -> claimed -> completed, com o request id" \
+    "created:$rid claimed:$rid completed:$rid" \
+    "$(curl -s --max-time 30 "$API/jobs/$job/events" -H 'X-Auth: 2:user' | events_summary)"
+  check "API gera X-Request-ID quando o cliente não manda" 1 \
+    "$(curl -s -D - -o /dev/null --max-time 30 "$API/jobs?limit=1" -H 'X-Auth: 2:user' | tr -d '\r' | awk 'tolower($1) == "x-request-id:" { print ($2 ~ /^[0-9a-f]+$/ && length($2) == 32) }')"
+  check "X-Request-ID inseguro para log é trocado por um gerado" 1 \
+    "$(curl -s -D - -o /dev/null --max-time 30 "$API/jobs?limit=1" -H 'X-Auth: 2:user' -H 'X-Request-ID: a b"c' | tr -d '\r' | awk 'tolower($1) == "x-request-id:" { print ($2 ~ /^[0-9a-f]+$/ && length($2) == 32) }')"
+  check "logs da API e do worker são JSON, uma linha por evento" ok \
+    "$(docker compose logs --no-color --no-log-prefix --tail 100 api worker | python3 -c '
+import json, sys
+lines = [l for l in sys.stdin if l.strip()]
+bad = 0
+for l in lines:
+    try:
+        json.loads(l)
+    except ValueError:
+        bad += 1
+print("ok" if lines and not bad else f"{bad} de {len(lines)} linhas não são JSON")')"
+
+  # Falha controlada: com o worker parado, o código real do worker processa o job com falha simulada.
+  local rid_fail job_fail run_log
+  rid_fail="verify-falha-$$-$(date +%s)"
+  wait_queue
+  docker compose stop worker >/dev/null 2>&1
+  job_fail=$(curl -s --max-time 30 -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' \
+    -H "X-Request-ID: $rid_fail" -d "$BODY" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("id", ""))' 2>/dev/null)
+  run_log=$(docker compose run --rm --no-deps -T -e SIMULATED_FAILURE_RATE=1 -e JOB_WORK_SECONDS=0 worker \
+    python -c 'import os, psycopg, worker; worker.process_once(psycopg.connect(os.environ["DATABASE_URL"], autocommit=True))' 2>&1)
+  docker compose start worker >/dev/null 2>&1
+  check "job que falhou fica failed e diz por quê (last_error)" "failed com last_error" \
+    "$(curl -s --max-time 30 "$API/jobs/${job_fail:-0}" -H 'X-Auth: 2:user' | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(str(d.get("status")) + (" com last_error" if d.get("last_error") else " sem last_error"))')"
+  check "linha do tempo da falha: created -> claimed -> failed, com o request id" \
+    "created:$rid_fail claimed:$rid_fail failed:$rid_fail" \
+    "$(curl -s --max-time 30 "$API/jobs/${job_fail:-0}/events" -H 'X-Auth: 2:user' | events_summary)"
+  check "log do worker da falha traz request id, job e erro" 1 \
+    "$(printf '%s\n' "$run_log" | grep -F "$rid_fail" | grep -F '"event": "failed"' | grep -c '"error": ' | awk '{ print ($1 > 0) }')"
 }
 
 perf() {

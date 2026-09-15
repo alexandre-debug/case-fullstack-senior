@@ -1,6 +1,15 @@
 import os
 from psycopg_pool import ConnectionPool
 
+def check_or_drain(conn):
+    # Uma conexão morta no pool quase sempre significa banco reiniciado, e aí as outras ociosas também morreram.
+    # Esvaziar o pool na primeira falha evita descartá-las uma por vez com backoff (503 por ~12s após um restart).
+    try:
+        ConnectionPool.check_connection(conn)
+    except Exception:
+        pool.drain()
+        raise
+
 # Pool: sem handshake TCP + autenticação a cada requisição (antes eram duas conexões novas por request, contando a auth).
 pool = ConnectionPool(
     os.environ["DATABASE_URL"],
@@ -10,7 +19,10 @@ pool = ConnectionPool(
     min_size=1,
     max_size=int(os.environ.get("DB_POOL_MAX_SIZE", "10")),
     timeout=5,  # espera máxima por uma conexão livre; estourou, vira 503
-    check=ConnectionPool.check_connection,  # descarta conexões mortas (ex.: banco reiniciado) antes de entregar
+    # Desiste cedo de reconectar em background: depois de uma queda longa, a próxima requisição tenta na hora
+    # em vez de esperar o backoff exponencial (que chega a minutos).
+    reconnect_timeout=10,
+    check=check_or_drain,
     open=False,
 )
 
