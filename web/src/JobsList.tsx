@@ -22,7 +22,9 @@ export function JobsList({ auth }: { auth: string }) {
     onError: (error: Error, id: number) => setErros((atual) => ({ ...atual, [id]: error.message })),
     onSettled: (_data: unknown, _error: unknown, id: number) => {
       setEmVoo((atual) => atual.filter((emAndamento) => emAndamento !== id));
+      // As duas listas mostram os mesmos jobs; a de admin tem queryKey própria e não seria alcançada.
       queryClient.invalidateQueries({ queryKey: ["/jobs", auth] });
+      queryClient.invalidateQueries({ queryKey: ["/admin/jobs", auth] });
     },
   };
 

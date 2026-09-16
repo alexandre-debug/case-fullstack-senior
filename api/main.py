@@ -67,7 +67,11 @@ app.add_middleware(
 )
 
 # Nos dois casos (db.py) é melhor pedir nova tentativa do que empilhar threads esperando.
+# Deadlock e cancelamento de statement entram aqui pelo mesmo motivo: são transitórios e a operação
+# pode ser repetida como está, então 503 informa isso melhor do que um 500 genérico.
 @app.exception_handler(errors.LockNotAvailable)
+@app.exception_handler(errors.DeadlockDetected)
+@app.exception_handler(errors.QueryCanceled)
 def lock_not_available(request, exc):
     # lock_timeout: outra operação segura a linha há mais de 5s.
     return JSONResponse({"detail": "recurso travado por outra operação, tente novamente"}, status_code=503, headers={"Retry-After": "1"})
@@ -167,7 +171,10 @@ def get_result(job_id: int, ctx=Depends(current_ctx)):
 # consulta. Serializar por empresa é proposital: é o que dá o limite correto (ver DECISIONS.md, seção 3).
 def travar_empresa(cur, company_id: int) -> tuple[int, int]:
     cur.execute("SELECT max_concurrent_jobs, job_quota FROM companies WHERE id=%s FOR NO KEY UPDATE", (company_id,))
-    return cur.fetchone()  # (limite de concorrência, cota)
+    row = cur.fetchone()
+    if row is None:  # empresa apagada entre a autenticação e o lock: 401, não 500
+        raise HTTPException(401, "X-Auth ausente ou inválido")
+    return row  # (limite de concorrência, cota)
 
 def checar_admissao(cur, company_id: int, limit: int, quota: int, ja_conta_como_ativo: bool) -> None:
     if quota <= 0:
@@ -244,8 +251,11 @@ CANCEL_SQL = TRANSITION_SQL.format(
 # job já em queued (409). attempts nunca é zerado, então o limite de tentativas continua valendo, e o CHECK
 # jobs_queued_attempts_check garante no banco que nenhum job volta para a fila sem tentativa sobrando.
 # request_id passa a ser o de quem pediu o reprocessamento: os logs da nova tentativa se ligam a esta requisição.
+# last_error e started_at são da tentativa anterior e saem da linha (a falha continua registrada em job_events),
+# senão a UI mostraria um job recém-enfileirado com o erro antigo em vermelho.
 RETRY_SQL = TRANSITION_SQL.format(
-    set_clause="status='queued', finished_at=NULL, lease_expires_at=NULL, updated_at=now(), request_id=%(request_id)s",
+    set_clause="status='queued', finished_at=NULL, lease_expires_at=NULL, last_error=NULL, started_at=NULL,"
+               " updated_at=now(), request_id=%(request_id)s",
     condition="target.old_status = 'failed' AND target.attempts < target.max_attempts",
     event_attempt="c.attempts",
 )

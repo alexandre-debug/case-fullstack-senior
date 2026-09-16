@@ -4,7 +4,7 @@
 # Cada checagem descreve o comportamento esperado DEPOIS das correções: na base
 # original ela documenta o problema (FAIL); depois das correções, comprova (PASS).
 #
-# Uso: scripts/verify.sh [schema|security|concurrency|trace|perf|all]
+# Uso: scripts/verify.sh [schema|security|concurrency|cancel|retry|trace|perf|all]
 #   all (padrão) roda tudo exceto perf, que popula a empresa 1 com 20 mil jobs.
 #
 # Atenção: cria jobs e dados no banco. Use apenas em ambiente local descartável.

@@ -120,6 +120,41 @@ def test_retry_concorrente_reprocessa_uma_vez_so(db, cliente, empresa):
     assert eventos(db, job_id).count("retried") == 1
 
 
+def test_nao_da_para_reprocessar_job_de_outra_empresa(db, api, empresa):
+    outra = db.execute("INSERT INTO companies (name) VALUES ('vizinha-retry') RETURNING id").fetchone()[0]
+    job_id = db.execute(
+        """INSERT INTO jobs (company_id, kind, status, attempts, last_error)
+           VALUES (%s, 'report', 'failed', 1, 'falha de teste') RETURNING id""",
+        (outra,),
+    ).fetchone()[0]
+    try:
+        for papel in ("user", "admin"):
+            resposta = api.post(f"/jobs/{job_id}/retry", headers={"X-Auth": f"{empresa}:{papel}"})
+            assert resposta.status_code == 404, f"{papel} de outra empresa reprocessou o job"
+        assert estado(db, job_id)[0] == "failed"
+    finally:
+        db.execute("DELETE FROM jobs WHERE company_id=%s", (outra,))
+        db.execute("DELETE FROM companies WHERE id=%s", (outra,))
+
+
+@pytest.mark.empresa(limite=50, cota=100)
+def test_retry_limpa_o_erro_da_tentativa_anterior(db, cliente, empresa):
+    """O job volta para a fila sem o erro antigo; a falha continua registrada na linha do tempo."""
+    job_id = db.execute(
+        """INSERT INTO jobs (company_id, kind, status, attempts, last_error, started_at, finished_at)
+           VALUES (%s, 'report', 'failed', 1, 'falha de teste', now(), now()) RETURNING id""",
+        (empresa,),
+    ).fetchone()[0]
+    db.execute("INSERT INTO job_events (job_id, event, attempt, detail) VALUES (%s, 'failed', 1, 'falha de teste')", (job_id,))
+
+    cliente("POST", f"/jobs/{job_id}/retry")
+
+    detalhe = cliente("GET", f"/jobs/{job_id}").json()
+    assert detalhe["last_error"] is None, "a UI mostraria um job enfileirado com o erro da tentativa anterior"
+    assert detalhe["started_at"] is None
+    assert "failed" in eventos(db, job_id), "a falha precisa continuar registrada na linha do tempo"
+
+
 @pytest.mark.empresa(limite=50, cota=100)
 def test_retry_completo_grava_resultado_e_cobra_uma_vez(db, cliente, empresa):
     """Ciclo falha -> retry -> conclusão: um resultado e uma cobrança no ciclo inteiro."""
