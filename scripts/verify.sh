@@ -197,12 +197,15 @@ except ValueError:
 print(code, status)'
 }
 
-wait_status() { # wait_status <job> <status> (até 30s)
+wait_status() { # wait_status <job> <status> (até 30s); devolve != 0 no timeout
   local i
   for i in $(seq 1 60); do
-    [ "$(sql "SELECT status FROM jobs WHERE id=$1")" = "$2" ] && return
+    [ "$(sql "SELECT status FROM jobs WHERE id=$1")" = "$2" ] && return 0
     sleep 0.5
   done
+  # Sem isto, uma pré-condição não atingida viraria um FAIL enganoso na checagem seguinte.
+  check "job $1 chegou a $2 (pré-condição)" "$2" "$(sql "SELECT status FROM jobs WHERE id=$1")"
+  return 1
 }
 
 job_state() { # job_state <job> -> "<status> <n> resultados"
@@ -243,14 +246,53 @@ cancel() {
 
   done_job=$(sql "SELECT id FROM jobs WHERE company_id=2 AND status='done' ORDER BY id DESC LIMIT 1")
   check "cancelar job concluído -> 409" 409 "$(http_code -X POST "$API/jobs/$done_job/cancel" -H 'X-Auth: 2:user')"
-  check "cancelar job de outra empresa -> 404" 404 "$(http_code -X POST "$API/jobs/$done_job/cancel" -H 'X-Auth: 1:user')"
-  check "job de outra empresa continua intacto" done "$(sql "SELECT status FROM jobs WHERE id=$done_job")"
   check "cancelar job inexistente -> 404" 404 "$(http_code -X POST "$API/jobs/2147483647/cancel" -H 'X-Auth: 2:user')"
+
+  # O alvo cross-tenant precisa ser CANCELÁVEL: com um job terminal, o 404 viria do estado e o teste passaria
+  # mesmo que o filtro por empresa fosse removido.
+  local alheio
+  docker compose stop worker >/dev/null 2>&1
+  alheio=$(new_job 1)
+  check "cancelar job cancelável de outra empresa -> 404" 404 "$(http_code -X POST "$API/jobs/$alheio/cancel" -H 'X-Auth: 2:user')"
+  check "o mesmo como admin da outra empresa -> 404 (admin não é papel de plataforma)" 404 \
+    "$(http_code -X POST "$API/jobs/$alheio/cancel" -H 'X-Auth: 2:admin')"
+  check "job da outra empresa continua na fila, intacto" queued "$(sql "SELECT status FROM jobs WHERE id=$alheio")"
+  check "o dono consegue cancelar o mesmo job" "200 cancelled" "$(cancel_call 1 "$alheio")"
+
+  # Vaga liberada de verdade: encher o limite, confirmar o 429, cancelar um e confirmar que abriu vaga.
+  local cheio_a cheio_b
+  cheio_a=$(new_job 2); cheio_b=$(new_job 2)
+  check "com o limite cheio, novo job -> 429" 429 \
+    "$(http_code -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d "$BODY")"
+  cancel_call 2 "$cheio_a" >/dev/null
+  check "depois de cancelar um, há vaga para outro job" 200 \
+    "$(http_code -X POST "$API/jobs" -H 'X-Auth: 2:user' -H 'Content-Type: application/json' -d "$BODY")"
+  sql "UPDATE jobs SET status='cancelled', finished_at=now() WHERE company_id=2 AND status IN ('queued','running')" >/dev/null
+  docker compose start worker >/dev/null 2>&1
 
   quota_after=$(sql "SELECT job_quota FROM companies WHERE id=2")
   check "nenhum job cancelado consumiu cota" 0 "$((quota_before - quota_after))"
-  check "job cancelado libera a vaga de concorrência" 0 \
-    "$(sql "SELECT count(*) FROM jobs WHERE company_id=2 AND status IN ('queued','running')")"
+
+  # A corrida do enunciado: cancelar perto do fim da janela de trabalho, várias vezes, aceitando os dois
+  # desfechos — mas exigindo que estado e efeitos combinem entre si.
+  local rodada codigo estado incoerentes=0 vencedor_cancel=0 vencedor_worker=0
+  for rodada in 1 2 3 4 5 6; do
+    wait_queue
+    job=$(new_job 2)
+    wait_status "$job" running
+    sleep 2.7  # JOB_WORK_SECONDS=3: o cancelamento chega junto do instante da finalização
+    codigo=$(cancel_call 2 "$job" | cut -d' ' -f1)
+    wait_job "$job"
+    estado=$(sql "SELECT status || ' ' || (SELECT count(*) FROM job_results WHERE job_id=$job) ||
+                         (SELECT count(*) FROM job_events WHERE job_id=$job AND event='completed') FROM jobs WHERE id=$job")
+    case "$codigo $estado" in
+      "200 cancelled 00") vencedor_cancel=$((vencedor_cancel + 1)) ;;  # cancelou: sem resultado, sem conclusão
+      "409 done 11") vencedor_worker=$((vencedor_worker + 1)) ;;       # worker ganhou: 1 resultado, 1 conclusão
+      *) incoerentes=$((incoerentes + 1)); printf '  info  rodada incoerente: HTTP %s, job %s\n' "$codigo" "$estado" ;;
+    esac
+  done
+  printf '  info  corrida cancelar x finalizar: %s vezes o cancelamento venceu, %s vezes o worker\n' "$vencedor_cancel" "$vencedor_worker"
+  check "toda corrida cancelar x finalizar terminou coerente (200=cancelado sem efeito, 409=concluído com efeito)" 0 "$incoerentes"
 }
 
 fail_job() { # fail_job <empresa> <request id> -> id de um job em failed (falha simulada com o código real do worker)

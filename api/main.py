@@ -141,7 +141,7 @@ def get_job(job_id: int, ctx=Depends(current_ctx)):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(f"SELECT {', '.join(JOB_FIELDS)} FROM jobs WHERE id=%s AND company_id=%s", (job_id, ctx["company_id"]))
         row = cur.fetchone()
-        if not row: raise HTTPException(404, "not found")
+        if not row: raise HTTPException(404, "job não encontrado")
         return dict(zip(JOB_FIELDS, row))
 
 @app.get("/jobs/{job_id}/events")
@@ -149,7 +149,7 @@ def get_job_events(job_id: int, ctx=Depends(current_ctx)):
     # Linha do tempo do job: qual requisição o criou, cada tentativa e por que falhou ou voltou para a fila.
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT 1 FROM jobs WHERE id=%s AND company_id=%s", (job_id, ctx["company_id"]))
-        if cur.fetchone() is None: raise HTTPException(404, "not found")
+        if cur.fetchone() is None: raise HTTPException(404, "job não encontrado")
         cur.execute("SELECT event, attempt, request_id, detail, created_at FROM job_events WHERE job_id=%s ORDER BY id", (job_id,))
         return [dict(zip(("event", "attempt", "request_id", "detail", "created_at"), r)) for r in cur.fetchall()]
 
@@ -161,7 +161,7 @@ def get_result(job_id: int, ctx=Depends(current_ctx)):
             (job_id, ctx["company_id"]),
         )
         row = cur.fetchone()
-        if not row: raise HTTPException(404, "no result")
+        if not row: raise HTTPException(404, "resultado não encontrado")
         return {"payload": row[0]}
 
 class NewJob(BaseModel):
@@ -208,64 +208,70 @@ def create_job(
         log("job criado", event="created", job_id=job_id, company_id=company_id, kind=body.kind)
         return {"id": job_id, "status": "queued"}
 
-# Só sai de queued/running, e só para a própria empresa. Quem grava primeiro vence a corrida com o worker:
-# se a finalização commitar antes, este UPDATE não casa e a resposta é 409; se o cancelamento commitar antes,
-# é a finalização do worker que não casa, e ele descarta o resultado sem cobrar cota.
-CANCEL_SQL = """WITH cancelled AS (
-  UPDATE jobs SET status='cancelled', finished_at=now(), lease_expires_at=NULL, updated_at=now()
-  WHERE id=%(id)s AND company_id=%(company_id)s AND status IN ('queued', 'running')
-  RETURNING id, attempts, status
+# As duas transições abaixo travam a linha do job (FOR UPDATE) e decidem tudo sob essa trava: o status que
+# justifica o 409 é o mesmo que impediu o UPDATE. Reler o status num SELECT à parte daria respostas
+# contraditórias (ex.: "job em queued não pode ser cancelado", se um retry concorrente commitasse no meio).
+TRANSITION_SQL = """WITH target AS (
+  SELECT id, status AS old_status, attempts, max_attempts FROM jobs
+  WHERE id=%(id)s AND company_id=%(company_id)s FOR UPDATE
+), changed AS (
+  UPDATE jobs SET {set_clause}
+  FROM target WHERE jobs.id = target.id AND {condition}
+  RETURNING jobs.id, jobs.attempts
 ), logged AS (
-  INSERT INTO job_events (job_id, event, attempt, request_id)
-  SELECT id, 'cancelled', nullif(attempts, 0), %(request_id)s FROM cancelled
+  INSERT INTO job_events (job_id, event, attempt, request_id, detail)
+  SELECT c.id, %(event)s, {event_attempt}, %(request_id)s, %(detail)s FROM changed c JOIN target t ON t.id = c.id
 )
-SELECT id, status FROM cancelled"""
+SELECT t.old_status, t.attempts, t.max_attempts, EXISTS (SELECT 1 FROM changed) FROM target t"""
+
+# Só sai de queued/running. Quem grava primeiro vence a corrida com o worker: se a finalização commitar antes,
+# este UPDATE não casa e a resposta é 409; se o cancelamento commitar antes, é a finalização do worker que não
+# casa, e ele descarta o resultado sem cobrar cota.
+# O evento só registra tentativa quando o job estava de fato rodando (em queued, a tentativa anterior já terminou).
+CANCEL_SQL = TRANSITION_SQL.format(
+    set_clause="status='cancelled', finished_at=now(), lease_expires_at=NULL, updated_at=now()",
+    condition="target.old_status IN ('queued', 'running')",
+    event_attempt="CASE WHEN t.old_status = 'running' THEN c.attempts END",
+)
+
+# failed -> queued só acontece uma vez: dois cliques simultâneos disputam a mesma linha e o segundo encontra o
+# job já em queued (409). attempts nunca é zerado, então o limite de tentativas continua valendo, e o CHECK
+# jobs_queued_attempts_check garante no banco que nenhum job volta para a fila sem tentativa sobrando.
+RETRY_SQL = TRANSITION_SQL.format(
+    set_clause="status='queued', finished_at=NULL, lease_expires_at=NULL, updated_at=now()",
+    condition="target.old_status = 'failed' AND target.attempts < target.max_attempts",
+    event_attempt="c.attempts",
+)
+
+def transition(cur, sql, job_id: int, company_id: int, event: str, detail: str | None = None):
+    cur.execute(sql, {"id": job_id, "company_id": company_id, "event": event, "detail": detail, "request_id": request_id_var.get()})
+    row = cur.fetchone()
+    if row is None:  # job de outra empresa responde o mesmo 404 de um id inexistente
+        raise HTTPException(404, "job não encontrado")
+    return row  # (status anterior, attempts, max_attempts, mudou)
 
 @app.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: int, ctx=Depends(current_ctx)):
     company_id = ctx["company_id"]
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(CANCEL_SQL, {"id": job_id, "company_id": company_id, "request_id": request_id_var.get()})
-        row = cur.fetchone()
-        if row is None:
-            # Nada mudou: ou o job não é desta empresa (mesmo 404 de um id inexistente), ou já está em estado terminal.
-            cur.execute("SELECT status FROM jobs WHERE id=%s AND company_id=%s", (job_id, company_id))
-            current = cur.fetchone()
-            if current is None:
-                raise HTTPException(404, "not found")
-            raise HTTPException(409, f"job em {current[0]} não pode ser cancelado")
+        old_status, _, _, cancelled = transition(cur, CANCEL_SQL, job_id, company_id, "cancelled")
+        if not cancelled:
+            raise HTTPException(409, f"job em {old_status} não pode ser cancelado")
         conn.commit()
-        log("job cancelado", event="cancelled", job_id=row[0], company_id=company_id)
-        return {"id": row[0], "status": row[1]}
-
-# failed -> queued só acontece uma vez: dois cliques simultâneos disputam a mesma linha e o segundo não casa
-# mais o WHERE (409). attempts nunca é zerado, então o limite de tentativas continua valendo, e o CHECK
-# jobs_queued_attempts_check garante no banco que nenhum job volta para a fila sem tentativa sobrando.
-RETRY_SQL = """WITH retried AS (
-  UPDATE jobs SET status='queued', finished_at=NULL, lease_expires_at=NULL, updated_at=now()
-  WHERE id=%(id)s AND company_id=%(company_id)s AND status='failed' AND attempts < max_attempts
-  RETURNING id, attempts, max_attempts
-), logged AS (
-  INSERT INTO job_events (job_id, event, attempt, request_id, detail)
-  SELECT id, 'retried', attempts, %(request_id)s, 'reprocessamento solicitado' FROM retried
-)
-SELECT id, attempts FROM retried"""
+        log("job cancelado", event="cancelled", job_id=job_id, company_id=company_id)
+        return {"id": job_id, "status": "cancelled"}
 
 @app.post("/jobs/{job_id}/retry")
 def retry_job(job_id: int, ctx=Depends(current_ctx)):
     company_id = ctx["company_id"]
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(RETRY_SQL, {"id": job_id, "company_id": company_id, "request_id": request_id_var.get()})
-        row = cur.fetchone()
-        if row is None:
-            cur.execute("SELECT status, max_attempts FROM jobs WHERE id=%s AND company_id=%s", (job_id, company_id))
-            current = cur.fetchone()
-            if current is None:
-                raise HTTPException(404, "not found")
-            if current[0] != "failed":
-                raise HTTPException(409, f"job em {current[0]} não pode ser reprocessado")
-            raise HTTPException(409, f"job esgotou as {current[1]} tentativas")
-        job_id, attempts = row
+        old_status, attempts, max_attempts, retried = transition(
+            cur, RETRY_SQL, job_id, company_id, "retried", "reprocessamento solicitado"
+        )
+        if not retried:
+            if old_status != "failed":
+                raise HTTPException(409, f"job em {old_status} não pode ser reprocessado")
+            raise HTTPException(409, f"job esgotou as {max_attempts} tentativas")
         # Voltar para a fila passa pela mesma admissão de um job novo (ordem de locks job -> empresa):
         # o retry não fura o limite de concorrência nem a cota. O job já conta como ativo aqui, daí o ">".
         cur.execute("SELECT max_concurrent_jobs, job_quota FROM companies WHERE id=%s FOR NO KEY UPDATE", (company_id,))
