@@ -1,5 +1,3 @@
 fastapi
 uvicorn[standard]
 psycopg[binary]
-# drain() (usado em db.py) só existe a partir da 3.3
-psycopg-pool>=3.3
