@@ -66,16 +66,32 @@ def test_job_que_falha_registra_o_motivo(db, conexao, cliente, empresa):
     assert eventos(db, job.id) == ["claimed", "failed"]
 
 
-def test_erro_interno_do_banco_nao_vaza_para_o_cliente(db, conexao, cliente, empresa):
-    """O texto do Postgres (tabela, ctid, PIDs) fica no log; o cliente recebe só a primeira linha."""
-    job = job_em_execucao(db, empresa, attempts=1)
-    erro_cru = 'LockNotAvailable: canceling statement due to lock timeout\nCONTEXT: while updating tuple (0,8) in relation "companies"'
+def test_erro_interno_do_banco_nao_vaza_para_o_cliente(db, conexao, cliente, empresa, monkeypatch):
+    """O texto do Postgres (tabela, ctid, PIDs) fica no log; o cliente recebe só a primeira linha.
 
-    worker.fail(conexao, job, erro_cru.splitlines()[0])
+    Exercita o caminho real: o erro é levantado dentro de work() e quem decide o que gravar é o
+    process_once — o teste não faz nenhum tratamento por conta própria.
+    """
+    db.execute("INSERT INTO jobs (company_id, kind, status) VALUES (%s, 'report', 'queued')", (empresa,))
+    erro_cru = RuntimeError(
+        'canceling statement due to lock timeout\n'
+        'CONTEXT:  while updating tuple (0,8) in relation "companies"\n'
+        'DETAIL:  Process 12784 waits for ShareLock on transaction 834'
+    )
+    monkeypatch.setattr(worker, "work", lambda conn, job: (_ for _ in ()).throw(erro_cru))
 
-    last_error = cliente("GET", f"/jobs/{job.id}").json()["last_error"]
-    assert "\n" not in last_error
-    assert "CONTEXT" not in last_error and "relation" not in last_error
+    while True:  # o worker real divide a fila; processa até cair no job desta empresa
+        assert worker.process_once(conexao), "a fila esvaziou antes de processar o job do teste"
+        job_id = db.execute(
+            "SELECT id FROM jobs WHERE company_id=%s AND status='failed' ORDER BY id DESC LIMIT 1", (empresa,)
+        ).fetchone()
+        if job_id:
+            break
+
+    last_error = cliente("GET", f"/jobs/{job_id[0]}").json()["last_error"]
+    assert last_error.startswith("RuntimeError: canceling statement")
+    assert "\n" not in last_error, "o cliente não deve receber as linhas CONTEXT/DETAIL do Postgres"
+    assert "relation" not in last_error and "Process" not in last_error
 
 
 def test_eventos_de_outra_empresa_nao_sao_visiveis(api, db, empresa):

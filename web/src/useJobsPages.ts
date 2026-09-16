@@ -3,7 +3,7 @@ import { get } from "./api";
 
 export type Job = {
   id: number;
-  company_id?: number;
+  company_id?: number; // só em /admin/jobs
   kind: string;
   status: string;
   created_at: string;

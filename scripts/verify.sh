@@ -440,16 +440,27 @@ perf() {
          INSERT INTO job_results (job_id, payload) SELECT id, 'resultado sensível da empresa 1' FROM novos" >/dev/null
     sql "ANALYZE" >/dev/null
   fi
-  # Zera o contador da tabela imediatamente antes de medir: ele é cumulativo e as estatísticas são
-  # publicadas com atraso, então uma leitura "antes/depois" capturaria atividade anterior à janela.
-  wait_queue
-  sql "SELECT pg_stat_reset_single_table_counters('job_results'::regclass)" >/dev/null
-  before=0
   t=$(curl -s -o /dev/null -w '%{time_total}' --max-time 600 "$API/jobs" -H 'X-Auth: 1:user')
-  sleep 11 # as estatísticas de outra sessão levam até ~10s para aparecer
-  after=$(sql "SELECT seq_scan FROM pg_stat_user_tables WHERE relname='job_results'")
   printf '  info  GET /jobs (empresa 1 com %s jobs): %ss\n' "$(sql "SELECT count(*) FROM jobs WHERE company_id=1")" "$t"
-  check "GET /jobs não faz seq scan em job_results (N+1 eliminado)" 0 "$((after - before))"
+
+  # Plano da consulta real da listagem. Inspecionar o plano em vez do contador pg_stat_user_tables:
+  # aquele é cumulativo e global (autovacuum e outras sessões entram na conta), o que tornava a checagem
+  # instável logo após uma carga grande.
+  check "GET /jobs varre job_results por índice, não sequencialmente (N+1 eliminado)" "sem seq scan" \
+    "$(sql "EXPLAIN (FORMAT JSON) SELECT j.id, j.company_id, j.kind, j.status, j.created_at, j.attempts,
+              j.max_attempts, j.last_error, (SELECT count(*) FROM job_results r WHERE r.job_id = j.id)
+            FROM jobs j WHERE j.company_id = 1 ORDER BY j.created_at DESC, j.id DESC LIMIT 51" |
+      python3 -c '
+import json, sys
+
+def varreduras(no):
+    yield no.get("Node Type", "") + " em " + no.get("Relation Name", "")
+    for filho in no.get("Plans", []):
+        yield from varreduras(filho)
+
+plano = json.load(sys.stdin)[0]["Plan"]
+ruins = [v for v in varreduras(plano) if v == "Seq Scan em job_results"]
+print(ruins[0] if ruins else "sem seq scan")')"
   check "GET /jobs responde em menos de 300 ms" 1 "$(python3 -c "print(int($t < 0.3))")"
 
   # Percorre todas as páginas: nenhum job repetido ou pulado, mesmo com milhares de created_at iguais.

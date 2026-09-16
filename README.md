@@ -262,9 +262,9 @@ novo, então respeita limite de concorrência e cota.
 GET /admin/jobs?limit=50&cursor=<opaco>
 ```
 
-Exige `role=admin` (`403` caso contrário) e retorna os jobs **da própria empresa do admin**, com o mesmo
-formato paginado de `GET /jobs`. Não existe papel de plataforma; o motivo está em
-[`DECISIONS.md`](DECISIONS.md), seção 3.
+Exige `role=admin` (`403` caso contrário) e retorna os jobs **da própria empresa do admin**. Mesmo item de
+`GET /jobs`, acrescido de `company_id`, e a mesma paginação por cursor. Não existe papel de plataforma; o
+motivo está em [`DECISIONS.md`](DECISIONS.md), seção 3.
 
 ## Estrutura do repositório
 

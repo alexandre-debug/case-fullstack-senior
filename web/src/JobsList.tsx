@@ -30,8 +30,8 @@ export function JobsList({ auth }: { auth: string }) {
   const retry = useMutation({ mutationFn: (id: number) => post(`/jobs/${id}/retry`, auth), ...acao });
   const verResultado = useMutation({
     mutationFn: async (id: number) => ({ id, payload: (await get(`/jobs/${id}/result`, auth)).payload as string }),
+    ...acao,
     onSuccess: setResult,
-    onError: (error, id) => setErros((atual) => ({ ...atual, [id]: error.message })),
   });
 
   const items: Job[] = jobs.data?.pages.flatMap((page) => page.items) ?? [];
@@ -61,7 +61,7 @@ export function JobsList({ auth }: { auth: string }) {
               </button>
             )}
             {job.result_count > 0 && (
-              <button onClick={() => verResultado.mutate(job.id)} disabled={verResultado.isPending}>
+              <button onClick={() => verResultado.mutate(job.id)} disabled={emVoo.includes(job.id)}>
                 Ver resultado
               </button>
             )}

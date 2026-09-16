@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from psycopg import errors
+from psycopg.rows import dict_row
 from psycopg_pool import PoolTimeout
 from pydantic import BaseModel
 from auth import current_ctx, require_admin
@@ -95,7 +96,7 @@ def decode_cursor(cursor: str) -> tuple[datetime, int]:
 # página, não ao total de jobs nem à profundidade (com OFFSET, cada página seria mais lenta que a anterior).
 # O id desempata created_at iguais (inserts em lote gravam o mesmo now() em vários jobs).
 JOBS_PAGE_SQL = """SELECT j.id, j.company_id, j.kind, j.status, j.created_at, j.attempts, j.max_attempts, j.last_error,
-       (SELECT count(*) FROM job_results r WHERE r.job_id = j.id)
+       (SELECT count(*) FROM job_results r WHERE r.job_id = j.id) AS result_count
 FROM jobs j
 WHERE j.company_id = %(company_id)s {after}
 ORDER BY j.created_at DESC, j.id DESC
@@ -107,29 +108,23 @@ def jobs_page(company_id: int, limit: int, cursor: str | None):
     params = {"company_id": company_id, "limit": limit + 1}
     if cursor is not None:
         params["created_at"], params["id"] = decode_cursor(cursor)
-    with get_conn() as conn, conn.cursor() as cur:
+    # Linhas como dict: acrescentar uma coluna ao SELECT não pode mudar em silêncio o que entra no cursor.
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(NEXT_PAGE_SQL if cursor is not None else FIRST_PAGE_SQL, params)
         rows = cur.fetchall()
-    next_cursor = encode_cursor(rows[limit - 1][4], rows[limit - 1][0]) if len(rows) > limit else None
-    return rows[:limit], next_cursor
+    ultimo = rows[limit - 1] if len(rows) > limit else None
+    return rows[:limit], encode_cursor(ultimo["created_at"], ultimo["id"]) if ultimo else None
 
 # cursor vazio é 422, não primeira página: senão um cliente que monte "cursor=" no fim da lista entraria em loop.
 PAGE_LIMIT = Query(50, ge=1, le=PAGE_SIZE_MAX)
 PAGE_CURSOR = Query(None, min_length=1, max_length=200)
 
+LIST_FIELDS = ("id", "kind", "status", "created_at", "attempts", "max_attempts", "last_error", "result_count")
+
 @app.get("/jobs")
 def list_jobs(ctx=Depends(current_ctx), limit: int = PAGE_LIMIT, cursor: str | None = PAGE_CURSOR):
     rows, next_cursor = jobs_page(ctx["company_id"], limit, cursor)
-    return {
-        "items": [
-            {
-                "id": r[0], "kind": r[2], "status": r[3], "created_at": r[4].isoformat(),
-                "attempts": r[5], "max_attempts": r[6], "last_error": r[7], "result_count": r[8],
-            }
-            for r in rows
-        ],
-        "next_cursor": next_cursor,
-    }
+    return {"items": [{campo: row[campo] for campo in LIST_FIELDS} for row in rows], "next_cursor": next_cursor}
 
 # Nas rotas por id, o company_id vai no WHERE: job de outra empresa responde o mesmo 404 de um id inexistente.
 # Os ids continuam sequenciais e globais, então ainda dá para inferir o volume de jobs de outras empresas
@@ -164,6 +159,29 @@ def get_result(job_id: int, ctx=Depends(current_ctx)):
         if not row: raise HTTPException(404, "resultado não encontrado")
         return {"payload": row[0]}
 
+# Admissão de um job na fila, usada pela submissão e pelo reprocessamento, em dois passos.
+#
+# Trava a linha da empresa: admissões da mesma empresa passam uma de cada vez, então a contagem continua
+# válida até o INSERT (antes, count e insert soltos deixavam 20 POSTs criarem 7 jobs com limite 2). É também
+# o que serializa duas requisições com a mesma Idempotency-Key, por isso a trava vem antes de qualquer
+# consulta. Serializar por empresa é proposital: é o que dá o limite correto (ver DECISIONS.md, seção 3).
+def travar_empresa(cur, company_id: int) -> tuple[int, int]:
+    cur.execute("SELECT max_concurrent_jobs, job_quota FROM companies WHERE id=%s FOR NO KEY UPDATE", (company_id,))
+    return cur.fetchone()  # (limite de concorrência, cota)
+
+def checar_admissao(cur, company_id: int, limit: int, quota: int, ja_conta_como_ativo: bool) -> None:
+    if quota <= 0:
+        raise HTTPException(402, "cota de jobs esgotada")
+    cur.execute("SELECT count(*) FROM jobs WHERE company_id=%s AND status IN ('queued','running')", (company_id,))
+    # No reprocessamento o job já voltou para a fila e entrou nesta contagem, então ele não conta contra si mesmo.
+    active = cur.fetchone()[0] - (1 if ja_conta_como_ativo else 0)
+    if active >= limit:
+        raise HTTPException(429, "limite de jobs concorrentes atingido")
+    # A cota é cobrada na conclusão; só admitir enquanto ela cobre todos os jobs ativos garante que
+    # nenhum job admitido chegue ao fim sem poder ser cobrado.
+    if active >= quota:
+        raise HTTPException(402, "cota restante já reservada para os jobs em andamento")
+
 class NewJob(BaseModel):
     kind: Literal["report", "import"]
 @app.post("/jobs")
@@ -175,10 +193,7 @@ def create_job(
     company_id = ctx["company_id"]
     request_id = request_id_var.get()
     with get_conn() as conn, conn.cursor() as cur:
-        # Trava a linha da empresa: admissões da mesma empresa passam uma de cada vez, então a contagem
-        # continua válida até o INSERT (antes, count e insert soltos deixavam 20 POSTs criarem 7 jobs com limite 2).
-        cur.execute("SELECT max_concurrent_jobs, job_quota FROM companies WHERE id=%s FOR NO KEY UPDATE", (company_id,))
-        limit, quota = cur.fetchone()
+        limit, quota = travar_empresa(cur, company_id)
         if idempotency_key:
             # Mesma chave = mesma intenção: devolve o job já criado (duplo clique, retry de rede).
             cur.execute("SELECT id, status, kind FROM jobs WHERE company_id=%s AND idempotency_key=%s", (company_id, idempotency_key))
@@ -188,16 +203,7 @@ def create_job(
                     raise HTTPException(422, "Idempotency-Key já usada com outro payload")
                 log("job reaproveitado pela Idempotency-Key", event="replayed", job_id=existing[0], company_id=company_id)
                 return {"id": existing[0], "status": existing[1]}
-        if quota <= 0:
-            raise HTTPException(402, "cota de jobs esgotada")
-        cur.execute("SELECT count(*) FROM jobs WHERE company_id=%s AND status IN ('queued','running')", (company_id,))
-        active = cur.fetchone()[0]
-        if active >= limit:
-            raise HTTPException(429, "limite de jobs concorrentes atingido")
-        # A cota é cobrada na conclusão; só admitir enquanto ela cobre todos os jobs ativos garante que
-        # nenhum job admitido chegue ao fim sem poder ser cobrado.
-        if active >= quota:
-            raise HTTPException(402, "cota restante já reservada para os jobs em andamento")
+        checar_admissao(cur, company_id, limit, quota, ja_conta_como_ativo=False)
         cur.execute(
             "INSERT INTO jobs (company_id, kind, status, idempotency_key, request_id) VALUES (%s,%s,'queued',%s,%s) RETURNING id",
             (company_id, body.kind, idempotency_key, request_id),
@@ -237,8 +243,9 @@ CANCEL_SQL = TRANSITION_SQL.format(
 # failed -> queued só acontece uma vez: dois cliques simultâneos disputam a mesma linha e o segundo encontra o
 # job já em queued (409). attempts nunca é zerado, então o limite de tentativas continua valendo, e o CHECK
 # jobs_queued_attempts_check garante no banco que nenhum job volta para a fila sem tentativa sobrando.
+# request_id passa a ser o de quem pediu o reprocessamento: os logs da nova tentativa se ligam a esta requisição.
 RETRY_SQL = TRANSITION_SQL.format(
-    set_clause="status='queued', finished_at=NULL, lease_expires_at=NULL, updated_at=now()",
+    set_clause="status='queued', finished_at=NULL, lease_expires_at=NULL, updated_at=now(), request_id=%(request_id)s",
     condition="target.old_status = 'failed' AND target.attempts < target.max_attempts",
     event_attempt="c.attempts",
 )
@@ -273,21 +280,18 @@ def retry_job(job_id: int, ctx=Depends(current_ctx)):
                 raise HTTPException(409, f"job em {old_status} não pode ser reprocessado")
             raise HTTPException(409, f"job esgotou as {max_attempts} tentativas")
         # Voltar para a fila passa pela mesma admissão de um job novo (ordem de locks job -> empresa):
-        # o retry não fura o limite de concorrência nem a cota. O job já conta como ativo aqui, daí o ">".
-        cur.execute("SELECT max_concurrent_jobs, job_quota FROM companies WHERE id=%s FOR NO KEY UPDATE", (company_id,))
-        limit, quota = cur.fetchone()
-        cur.execute("SELECT count(*) FROM jobs WHERE company_id=%s AND status IN ('queued','running')", (company_id,))
-        active = cur.fetchone()[0]
-        if active > limit:
-            raise HTTPException(429, "limite de jobs concorrentes atingido")
-        if active > quota:
-            raise HTTPException(402, "cota restante já reservada para os jobs em andamento")
+        # o retry não fura o limite de concorrência nem a cota. Se não couber, o rollback desfaz a transição.
+        checar_admissao(cur, company_id, *travar_empresa(cur, company_id), ja_conta_como_ativo=True)
         conn.commit()
         log("job reprocessado", event="retried", job_id=job_id, company_id=company_id, attempts=attempts)
         return {"id": job_id, "status": "queued", "attempts": attempts}
 
 # Não existe papel de plataforma: o admin é da empresa e vê todos os jobs só da própria empresa.
+# Mesmo item de GET /jobs, mais o company_id (a UI de admin reaproveita o mesmo componente de lista).
 @app.get("/admin/jobs")
 def admin_jobs(ctx=Depends(require_admin), limit: int = PAGE_LIMIT, cursor: str | None = PAGE_CURSOR):
     rows, next_cursor = jobs_page(ctx["company_id"], limit, cursor)
-    return {"items": [{"id": r[0], "company_id": r[1], "kind": r[2], "status": r[3]} for r in rows], "next_cursor": next_cursor}
+    return {
+        "items": [{"company_id": row["company_id"], **{campo: row[campo] for campo in LIST_FIELDS}} for row in rows],
+        "next_cursor": next_cursor,
+    }

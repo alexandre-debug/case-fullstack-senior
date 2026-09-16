@@ -5,8 +5,9 @@
 > `docker compose run --rm tests` (60 testes de integração em pytest, que exercitam o código real
 > do worker e a API por HTTP).
 >
-> Cada checagem do `verify.sh` foi escrita **antes** da correção, falhando na base original e passando
-> depois — é o registro executável do antes e depois.
+> O `verify.sh` foi escrito junto com cada correção: as checagens que descrevem um defeito **falham na base
+> original** e passam depois (na base original o resultado era 4 PASS / 21 FAIL). As demais são controles
+> positivos, verdes antes e depois, para que um FAIL nelas denuncie que o teste parou de medir o que promete.
 
 ---
 
@@ -46,7 +47,8 @@ Reproduzi cada item no stack rodando antes de corrigir. "Medido" = número obtid
 | Só adicionando índices | 0,87 s | **Índice sozinho não resolve**: o N+1 continua |
 
 Outros achados de modelagem: sem paginação (resposta de 2,2 MB); `ORDER BY created_at` instável
-(o seed cria 15 mil jobs com o mesmo timestamp); `status` sem `CHECK`; `job_results` sem unicidade;
+(qualquer `INSERT` em lote grava o mesmo `now()` em todas as linhas: no repro de carga, 20 mil jobs
+compartilham um único `created_at`); `status` sem `CHECK`; `job_results` sem unicidade;
 sequences de `companies`/`users` não avançadas no seed (o próximo INSERT sem id colidia); migrações
 impossíveis, porque `docker-entrypoint-initdb.d` **só roda com volume vazio** (confirmado: o Postgres
 registra *"Skipping initialization"*); uma conexão nova por requisição, sem pool; healthcheck do banco
@@ -73,17 +75,22 @@ e um job que falhava não deixava registro nenhum do motivo.
 ## 2. Correções — o que fiz e como verifiquei
 
 ### Segurança
+*Arquivos: `api/auth.py`, `api/main.py`, `api/Dockerfile`, `docker-compose.yml`.*
+
 `company_id` no `WHERE` de toda rota por id, com **404 idêntico** ao de id inexistente (um 403 confirmaria
 que o job existe). `/admin/jobs` exige papel admin e é limitado à própria empresa. `X-Auth` validado por
 regex estrita mais existência da empresa: qualquer outra coisa é 401, nunca 500. `kind` restrito a
 `report`/`import`. CORS restrito à origem da UI, `TrustedHostMiddleware` contra rebinding e serviços
 publicados só em `127.0.0.1`.
 
-**Verificação:** 26 checagens em `verify.sh security` + 22 testes em `tests/test_seguranca.py`. O teste de
+**Verificação:** 26 checagens em `verify.sh security` + 26 testes em `tests/test_seguranca.py`. O teste de
 isolamento usa um job **cancelável** de outra empresa: com um job terminal, o 404 viria do estado e a
 checagem passaria mesmo sem o filtro por empresa (foi um achado da revisão contra o meu próprio teste).
 
 ### Sintoma 2 — concorrência
+*Arquivos: `worker/worker.py` (reescrito), `api/main.py`, `db/migrations/002_job_lifecycle.sql`,
+`docker-compose.yml`.*
+
 - **Admissão atômica:** `SELECT ... FROM companies FOR NO KEY UPDATE` antes de contar e inserir. Testei três
   alternativas: sem lock deu `[16,18,14,12,15]` ativos com limite 2; `INSERT ... SELECT WHERE count < max`
   num único comando deu `[17,8,12,13,14]` (**não basta**, porque sob READ COMMITTED cada transação lê o
@@ -95,29 +102,52 @@ checagem passaria mesmo sem o filtro por empresa (foi um achado da revisão cont
   condicional (`AND job_quota > 0`) na mesma transação, isso dá **exactly-once** no efeito, mesmo com
   entrega at-least-once.
 - **Lease e recuperação:** prazo gravado na linha e renovado durante o trabalho; um reaper devolve jobs de
-  workers mortos (ou marca `failed` sem tentativas restantes). O job órfão do seed foi recuperado em 1 s.
+  workers mortos (ou marca `failed` sem tentativas restantes). O job órfão do seed é recuperado assim que
+  vence o lease de 30 s que a migração `002` concede aos jobs já em `running`: ~30 s depois de um `up` do
+  zero, e na hora num banco que já estava parado.
 - **Constraints no banco:** status válido, `job_quota >= 0` e "job na fila sempre tem tentativa sobrando".
 - **`Idempotency-Key`** opcional no `POST /jobs`: a mesma chave devolve o mesmo job.
 
-**Verificação:** além do `verify.sh`, dois testes de estresse de 30–40 s (3 workers, 30% de falha simulada,
-16 clientes, conexões derrubadas periodicamente). Invariantes conferidos ao final: limite nunca excedido,
-resultados = concluídos = cobranças por empresa, nenhum job preso, **0 deadlocks**.
+**Verificação:** `verify.sh concurrency` e `tests/test_concorrencia.py` cobrem cada garantia isoladamente.
+Além disso rodei, de forma exploratória e **não versionada**, cenários de estresse de 30–40 s (3 workers,
+30% de falha simulada, 16 clientes, conexões do worker derrubadas a cada 4 s), conferindo os invariantes ao
+final: limite nunca excedido, resultados = concluídos = cobranças por empresa, nenhum job preso e nenhum
+deadlock no log do Postgres. Não estão no repositório porque dependem de tempo de execução e de escalar
+réplicas; versionar isso exigiria um alvo de teste separado, que registrei como próximo passo.
+
+**Comportamento em escala.** As duas correções principais têm custo assumido. A admissão **serializa por
+empresa** (todas as submissões e reprocessamentos da mesma empresa disputam a linha em `companies`), o que
+impõe um teto de admissões por segundo por empresa — e é exatamente isso que dá o limite correto. Empresas
+diferentes não competem entre si, porque cada uma tem a própria linha. O `finish` também toca essa linha,
+então a contenção cresce com a taxa de conclusão de uma mesma empresa. Se isso virasse gargalo, o caminho
+seria trocar a linha única por um contador particionado, ou mover o controle de concorrência para o claim do
+worker. Já o claim é naturalmente paralelo: `FOR UPDATE SKIP LOCKED` faz cada worker pular o que outro já
+segura, então acrescentar réplicas aumenta a vazão sem contenção.
 
 ### Sintoma 1 — listagem
+*Arquivos: `api/main.py`, `api/db.py`, `api/requirements.txt`,
+`db/migrations/003_jobs_listing_index.sql`, `web/src/`.*
+
 Consulta única, paginação por cursor em `(created_at, id)` e índice
 `jobs(company_id, created_at DESC, id DESC)`. Mais um pool de conexões.
 
-| | Antes | Depois |
+| `GET /jobs`, empresa com 20 mil jobs com resultado | Antes (lista inteira, 2,2 MB) | Depois (primeira página de 50) |
 |---|---|---|
-| 20 mil jobs com resultado | 10,3 s | **6 ms** |
+| Tempo de resposta | 10,3 s | **4 a 13 ms** (5 medições seguidas) |
 | Seq scans em `job_results` por requisição | 20.000 | **0** |
-| Página na posição 900.000 (1 milhão de jobs) | — | **~3 ms** (com `OFFSET` seriam **871 ms**) |
+| Página na posição 900.000 (1 milhão de jobs) | não existia paginação | **~3 ms** (com `OFFSET` seriam **871 ms**) |
+
+Percorrer **todas** as 100 páginas de 200 itens leva ~2 s no total, e a página mais lenta fica em 30 ms —
+ou seja, a melhora não vem de entregar menos dado, e sim de eliminar o N+1 e o custo por profundidade.
 
 O `id` no cursor é essencial: o seed cria 15 mil jobs com o mesmo `created_at`, e sem desempate a
 paginação repetiria ou pularia registros. O `verify.sh perf` percorre todas as páginas conferindo que
 nenhum job é repetido ou pulado.
 
 ### Sintoma 3 — rastreabilidade
+*Arquivos: `api/logging_setup.py`, `worker/logging_setup.py` (novos), `api/main.py`, `worker/worker.py`,
+`api/Dockerfile`, `db/migrations/004_job_traceability.sql`, `db/migrations/006_job_events_tuning.sql`.*
+
 `X-Request-ID` aceito do cliente (se seguro para log) ou gerado, devolvido no header, **gravado no job** e
 repetido em todos os logs do worker. Logs em JSON com uma linha por evento — o que também elimina a injeção
 de linha do S4. Tabela `job_events` grava cada transição **na mesma instrução** que a executa, então a linha
@@ -127,7 +157,16 @@ Hoje o repro do `KNOWN_ISSUES` responde a pergunta: `docker compose logs worker 
 `claimed` e `completed` do mesmo job que a API registrou como criado.
 
 ### Features A e B
-Detalhadas na seção 3.
+*Arquivos: `api/main.py`, `worker/worker.py`, `db/migrations/005_job_cancel.sql`, `web/src/JobsList.tsx`,
+`web/src/api.ts`, `tests/test_features.py`.* O desenho e as corridas estão na seção 3.
+
+### Infraestrutura de suporte
+*Arquivos: `db/migrate.sh` e `db/migrations/` (novos), `scripts/verify.sh` (novo), `tests/` (novo),
+`docker-compose.yml`, `.gitattributes`, `.env.example`.*
+
+Executor de migrações versionadas; healthcheck do banco via TCP com `start_period` (o anterior dava "pronto"
+7 s antes de o seed terminar); portas do host configuráveis; `.gitattributes` forçando LF, senão um clone no
+Windows quebraria o `migrate.sh`.
 
 ---
 
@@ -172,8 +211,8 @@ criei `db/migrate.sh`, que aplica `db/migrations/*.sql` uma vez cada, cada arqui
 `lock_timeout`, registrando em `schema_migrations`. API e worker só sobem depois dele.
 
 **Ordem de locks job → empresa** em todos os caminhos que tocam os dois (finalização, retry). A admissão
-toca só a empresa, e o cancelamento só o job. Essa é a invariante que evita deadlock, e os testes de
-estresse confirmam: **0 deadlocks** em todas as execuções.
+toca só a empresa, e o cancelamento só o job. Essa é a invariante que evita deadlock, e nenhuma
+execução dos cenários de estresse registrou deadlock no log do Postgres.
 
 ---
 
@@ -185,7 +224,7 @@ estresse confirmam: **0 deadlocks** em todas as execuções.
   Corrigir exigiria coluna nova, mudança em todas as rotas, no worker e no front, por um vazamento de
   metadado — desproporcional agora, e registrado como próximo passo.
 - **Migrações sem bloqueio para tabelas gigantes.** A `003` cria índice sem `CONCURRENTLY`, o que trava
-  escritas em `jobs` durante a construção (**medido: menos de 300 ms com 1 milhão de jobs**). Em produção
+  escritas em `jobs` durante a construção (**~250 ms com 1 milhão de jobs**). Em produção
   seria `CREATE INDEX CONCURRENTLY` e `CHECK ... NOT VALID` + `VALIDATE`, o que exige suporte a migrações
   fora de transação no `migrate.sh`.
 - **Retenção de `job_events`.** A tabela cresce sem limite (~450 bytes por job). Deixei `ON DELETE CASCADE`
@@ -193,7 +232,8 @@ estresse confirmam: **0 deadlocks** em todas as execuções.
 - **Fairness entre empresas.** A fila é FIFO global: uma empresa com muitos jobs atrasa as outras. O limite
   de concorrência limita o dano, mas não é escalonamento justo.
 - **Rate limiting** e **backoff exponencial entre tentativas.** Hoje o retry é imediato.
-- **Testes de frontend.** O front tem `tsc` e `vite build` no fluxo, mas não testes de componente.
+- **Testes de frontend.** Há `npm run typecheck` (`tsc --noEmit`, com `strict` ligado) e `npm run build`,
+  mas nenhum teste de componente e nenhum gate de CI que os execute automaticamente.
 - **Fila dedicada (SQS, Redis).** Postgres dá conta neste volume e mantém tudo numa transação só; trocar
   agora traria consistência distribuída sem necessidade.
 
@@ -234,14 +274,19 @@ coisa.
 
 ## 6. Casos de borda
 
-**Tratados e testados:** worker morto por SIGKILL no meio do job (lease devolve); `SIGTERM` (termina se
-faltam menos de 5 s, senão devolve o job na hora — e descobri que o Docker desta máquina dá só 1 s antes do
+**Tratados e cobertos por teste automatizado:** lease vencido (devolve à fila; sem tentativas restantes vira
+`failed`); tentativa antiga tentando finalizar; finalização repetida; cota zerando com job em execução
+(falha em vez de ficar negativa); `Idempotency-Key` concorrente e reusada com outro payload (422); cursor
+adulterado e `limit` fora da faixa (422, nunca 500); job de outra empresa em todas as rotas; cancelar e
+reprocessar em todos os estados; corrida cancelar × finalizar; erro interno do banco não vazando no
+`last_error`; `created_at` empatado na paginação (`verify.sh perf` percorre as 100 páginas).
+
+**Tratados e verificados manualmente** (reproduzi no stack, mas não versionei o teste, porque dependem de
+matar processos e manipular o Docker): worker morto por SIGKILL no meio do job; `SIGTERM` (termina se faltam
+menos de 5 s, senão devolve o job na hora — e descobri que o Docker desta máquina dá só 1 s antes do
 SIGKILL, daí o `stop_grace_period`); conexão do banco derrubada (reconecta sem reiniciar o container);
-banco reiniciado (pool esvazia e responde na hora, em vez de ~12 s de 503); cota zerando com job em
-execução (falha em vez de ficar negativa); lease vencido sem tentativas restantes (vira `failed`);
-`Idempotency-Key` reusada com outro payload (422); cursor adulterado (422, nunca 500); job de outra empresa
-em todas as rotas; cancelar e reprocessar em todos os estados; `created_at` empatado na paginação;
-erro do banco na gravação do desfecho (motivo original preservado no log).
+banco reiniciado (pool esvazia e responde na hora, em vez de ~12 s de 503); erro do banco na gravação do
+desfecho (motivo original preservado no log).
 
 **Reconhecidos e não tratados:** banco *congelado* (não caído) prende até 10 requisições, e as demais
 recebem 503 em 5 s; exceção depois do início da resposta escaparia do log de acesso (hoje inalcançável,
