@@ -37,6 +37,8 @@ services:
       PYTHONUNBUFFERED: "1"
       CORS_ORIGINS: http://localhost:${WEB_PORT:-5173},http://127.0.0.1:${WEB_PORT:-5173}
       DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
+      # "api" é o nome do serviço na rede do compose, usado pelos testes de integração.
+      ALLOWED_HOSTS: localhost,127.0.0.1,api
     # Portas só no loopback: a auth do case é um header forjável, então o alcance de rede
     # é a única barreira entre empresas.
     ports: ["127.0.0.1:${API_PORT:-8000}:8000"]
@@ -56,6 +58,21 @@ services:
     # explícito porque o padrão do Docker varia (1s em algumas instalações, o que mataria o job no meio).
     stop_grace_period: 15s
     restart: on-failure
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  # Testes de integração: rodam contra o stack de pé, com "docker compose run --rm tests".
+  # O profile evita que subam junto com "docker compose up".
+  tests:
+    build: ./tests
+    profiles: ["test"]
+    environment:
+      DATABASE_URL: postgresql://relay:relay@db:5432/relay
+      API_URL: http://api:8000
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./tests:/tests:ro
+      - ./worker:/worker:ro  # os testes exercitam o código real do worker
     depends_on:
       migrate:
         condition: service_completed_successfully

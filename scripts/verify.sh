@@ -440,12 +440,16 @@ perf() {
          INSERT INTO job_results (job_id, payload) SELECT id, 'resultado sensível da empresa 1' FROM novos" >/dev/null
     sql "ANALYZE" >/dev/null
   fi
-  before=$(sql "SELECT seq_scan FROM pg_stat_user_tables WHERE relname='job_results'")
+  # Zera o contador da tabela imediatamente antes de medir: ele é cumulativo e as estatísticas são
+  # publicadas com atraso, então uma leitura "antes/depois" capturaria atividade anterior à janela.
+  wait_queue
+  sql "SELECT pg_stat_reset_single_table_counters('job_results'::regclass)" >/dev/null
+  before=0
   t=$(curl -s -o /dev/null -w '%{time_total}' --max-time 600 "$API/jobs" -H 'X-Auth: 1:user')
-  sleep 11 # estatísticas de outras sessões podem levar até ~10s para aparecer
+  sleep 11 # as estatísticas de outra sessão levam até ~10s para aparecer
   after=$(sql "SELECT seq_scan FROM pg_stat_user_tables WHERE relname='job_results'")
   printf '  info  GET /jobs (empresa 1 com %s jobs): %ss\n' "$(sql "SELECT count(*) FROM jobs WHERE company_id=1")" "$t"
-  check "GET /jobs não faz seq scan em job_results" 0 "$((after - before))"
+  check "GET /jobs não faz seq scan em job_results (N+1 eliminado)" 0 "$((after - before))"
   check "GET /jobs responde em menos de 300 ms" 1 "$(python3 -c "print(int($t < 0.3))")"
 
   # Percorre todas as páginas: nenhum job repetido ou pulado, mesmo com milhares de created_at iguais.
