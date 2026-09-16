@@ -15,7 +15,9 @@ export function SubmitForm({ auth }: { auth: string }) {
     mutationFn: () => post("/jobs", auth, { kind }, { "Idempotency-Key": chave.current }),
     onSuccess: () => {
       chave.current = crypto.randomUUID();
+      // As duas listas mostram os mesmos jobs; a de admin tem queryKey própria e não seria alcançada.
       queryClient.invalidateQueries({ queryKey: ["/jobs", auth] });
+      queryClient.invalidateQueries({ queryKey: ["/admin/jobs", auth] });
     },
   });
 

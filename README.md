@@ -52,7 +52,7 @@ uma vez por migração, registrando em `schema_migrations`. Um banco já existen
 scripts/verify.sh all     # 87 checagens caixa-preta contra o stack (schema, segurança, concorrência,
                           # cancelamento, reprocessamento e rastreabilidade)
 scripts/verify.sh perf    # popula 20 mil jobs e mede a listagem
-docker compose run --rm tests   # 60 testes de integração (pytest)
+docker compose run --rm tests   # 62 testes de integração (pytest)
 ```
 
 > Atenção: os dois primeiros criam e alteram dados. Use só em ambiente local descartável.

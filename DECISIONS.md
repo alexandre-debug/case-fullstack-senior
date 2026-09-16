@@ -2,12 +2,12 @@
 
 > **Como verificar:** `docker compose up -d --build`, depois `scripts/verify.sh all` (87 checagens
 > caixa-preta contra o stack), `scripts/verify.sh perf` (popula 20 mil jobs e mede a listagem) e
-> `docker compose run --rm tests` (60 testes de integração em pytest, que exercitam o código real
+> `docker compose run --rm tests` (62 testes de integração em pytest, que exercitam o código real
 > do worker e a API por HTTP).
 >
 > O `verify.sh` foi escrito junto com cada correção: as checagens que descrevem um defeito **falham na base
-> original** e passam depois (na base original o resultado era 4 PASS / 21 FAIL). As demais são controles
-> positivos, verdes antes e depois, para que um FAIL nelas denuncie que o teste parou de medir o que promete.
+> original** e passam depois. As demais são controles positivos, verdes antes e depois, para que um FAIL
+> nelas denuncie que o teste parou de medir o que promete.
 
 ---
 
@@ -140,18 +140,20 @@ Consulta única, paginação por cursor em `(created_at, id)` e índice
 Percorrer **todas** as 100 páginas de 200 itens leva ~2 s no total, e a página mais lenta fica em 30 ms —
 ou seja, a melhora não vem de entregar menos dado, e sim de eliminar o N+1 e o custo por profundidade.
 
-O `id` no cursor é essencial: o seed cria 15 mil jobs com o mesmo `created_at`, e sem desempate a
-paginação repetiria ou pularia registros. O `verify.sh perf` percorre todas as páginas conferindo que
-nenhum job é repetido ou pulado.
+O `id` no cursor é essencial: a carga do `verify.sh perf` cria ~20 mil jobs com o mesmo `created_at`, e
+sem desempate a paginação repetiria ou pularia registros. O `verify.sh perf` percorre todas as páginas
+conferindo que nenhum job é repetido ou pulado.
 
 ### Sintoma 3 — rastreabilidade
-*Arquivos: `api/logging_setup.py`, `worker/logging_setup.py` (novos), `api/main.py`, `worker/worker.py`,
-`api/Dockerfile`, `db/migrations/004_job_traceability.sql`, `db/migrations/006_job_events_tuning.sql`.*
+*Arquivos: `worker/logging_setup.py` (novo), `api/logging_setup.py` (reescrito), `api/main.py`,
+`worker/worker.py`, `api/Dockerfile`, `db/migrations/004_job_traceability.sql`,
+`db/migrations/006_job_events_tuning.sql`.*
 
 `X-Request-ID` aceito do cliente (se seguro para log) ou gerado, devolvido no header, **gravado no job** e
 repetido em todos os logs do worker. Logs em JSON com uma linha por evento — o que também elimina a injeção
-de linha do S4. Tabela `job_events` grava cada transição **na mesma instrução** que a executa, então a linha
-do tempo nunca diverge do estado. `last_error` e o endpoint `GET /jobs/{id}/events` completam o diagnóstico.
+de linha do S4. Tabela `job_events` grava cada transição na **mesma transação** da instrução que a executa
+(na maioria dos casos, na própria instrução), então a linha do tempo nunca diverge do estado. `last_error`
+e o endpoint `GET /jobs/{id}/events` completam o diagnóstico.
 
 Hoje o repro do `KNOWN_ISSUES` responde a pergunta: `docker compose logs worker | grep <request_id>` mostra
 `claimed` e `completed` do mesmo job que a API registrou como criado.
