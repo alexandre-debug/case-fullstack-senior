@@ -5,36 +5,80 @@ services:
       POSTGRES_USER: relay
       POSTGRES_PASSWORD: relay
       POSTGRES_DB: relay
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:${DB_PORT:-5432}:5432"]
     volumes:
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      # Via TCP: durante o initdb o Postgres sobe um servidor temporário só no socket unix,
+      # e checar pelo socket dava "pronto" antes de schema.sql/seed.sql terminarem.
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay -h 127.0.0.1"]
+      start_period: 60s
       interval: 2s
       timeout: 3s
       retries: 15
+  migrate:
+    image: postgres:16
+    environment:
+      PGHOST: db
+      PGUSER: relay
+      PGPASSWORD: relay
+      PGDATABASE: relay
+    volumes:
+      - ./db:/db:ro
+    entrypoint: ["sh", "/db/migrate.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
   api:
     build: ./api
     environment:
       DATABASE_URL: postgresql://relay:relay@db:5432/relay
       PYTHONUNBUFFERED: "1"
-    ports: ["8000:8000"]
+      CORS_ORIGINS: http://localhost:${WEB_PORT:-5173},http://127.0.0.1:${WEB_PORT:-5173}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
+      # "api" é o nome do serviço na rede do compose, usado pelos testes de integração.
+      ALLOWED_HOSTS: localhost,127.0.0.1,api
+    # Portas só no loopback: a auth do case é um header forjável, então o alcance de rede
+    # é a única barreira entre empresas.
+    ports: ["127.0.0.1:${API_PORT:-8000}:8000"]
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
   worker:
     build: ./worker
     environment:
       DATABASE_URL: postgresql://relay:relay@db:5432/relay
       PYTHONUNBUFFERED: "1"
+      JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-30}
+      # 3s de trabalho simulado: dá para ver o job em running na UI e cancelá-lo antes de terminar.
+      JOB_WORK_SECONDS: ${JOB_WORK_SECONDS:-3}
+      SIMULATED_FAILURE_RATE: ${SIMULATED_FAILURE_RATE:-0}
+    # No SIGTERM o worker termina o job se faltarem até 5s (SHUTDOWN_GRACE_SECONDS) ou o devolve para a fila;
+    # explícito porque o padrão do Docker varia (1s em algumas instalações, o que mataria o job no meio).
+    stop_grace_period: 15s
     restart: on-failure
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+  # Testes de integração: rodam contra o stack de pé, com "docker compose run --rm tests".
+  # O profile evita que subam junto com "docker compose up".
+  tests:
+    build: ./tests
+    profiles: ["test"]
+    environment:
+      DATABASE_URL: postgresql://relay:relay@db:5432/relay
+      API_URL: http://api:8000
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./tests:/tests:ro
+      - ./worker:/worker:ro  # os testes exercitam o código real do worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
   web:
     build: ./web
     environment:
-      VITE_API_URL: http://localhost:8000
-    ports: ["5173:5173"]
+      VITE_API_URL: http://localhost:${API_PORT:-8000}
+    ports: ["127.0.0.1:${WEB_PORT:-5173}:5173"]
     depends_on: [api]
